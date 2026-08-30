@@ -107,7 +107,10 @@ def main() -> int:
     # ArtifactHashes may be dict (spec) or list (legacy); normalize
     if isinstance(artifact_hashes, list):
         # Legacy: cannot verify per-entry hash from list alone
-        print("WARN: artifactHashes is list (legacy), skipping per-entry hash check", file=sys.stderr)
+        print(
+            "WARN: artifactHashes is list (legacy), skipping per-entry hash check",
+            file=sys.stderr,
+        )
         artifact_hashes = {}
     canonical_dir = ROOT / args.canonical_dir
     local_ok = 0
@@ -155,7 +158,11 @@ def main() -> int:
     mhash = manifest.get("manifestHash") or manifest.get("manifest_hash")
     if mhash is not None:
         recomputed = manifest_hash(
-            {k: v for k, v in manifest.items() if k not in ("manifestHash", "manifest_hash")}
+            {
+                k: v
+                for k, v in manifest.items()
+                if k not in ("manifestHash", "manifest_hash")
+            }
         )
         if mhash.lower() != recomputed.lower():
             print(

@@ -16,8 +16,8 @@ description = "Ruff format check and lint"
 run = "ruff format --check . && ruff check ."
 
 [tasks.type]
-description = "Type check with mypy strict"
-run = "mypy --strict src"
+description = "Type check with mypy (strict via config, no duplicate flag)"
+run = "mypy src"
 
 [tasks.test]
 description = "Run pytest suite"
