@@ -1,0 +1,28 @@
+# Environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+
+# Build and coverage output
+dist/
+build/
+coverage/
+.next/
+
+# Generated data and local caches
+*.oxt
+*.trie
+*.spl
+.cache/
+tmp/
+*.log
