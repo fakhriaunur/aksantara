@@ -645,7 +645,7 @@ class FirestoreVectorStore(EmbeddingStore):
                     "version", doc_id.split("_")[-1] if "_" in doc_id else ""
                 ),
                 lema=data.get("lema", ""),
-                embedding=tuple(float(x) for x in vec) if vec else tuple(),
+                embedding=tuple(float(x) for x in vec) if vec else (),
                 model=data.get("model", "gemini-embedding-001"),
                 dimensions=int(data.get("dimensions", DEFAULT_DIMS)),
                 content_hash=data.get("contentHash", data.get("content_hash", "")),

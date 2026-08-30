@@ -25,6 +25,9 @@ dev = [
     "mypy==2.3.1",
     "pytest==9.1.1",
     "pytest-asyncio>=0.23.0",
+    "pytest-cov>=6.0.0",
+    "coverage[toml]>=7.6.0",
+    "vulture>=2.9",
     "httpx==0.28.1",
 ]
 
@@ -37,10 +40,16 @@ target-version = "py313"
 line-length = 88
 
 [tool.ruff.lint]
-select = ["E", "F", "B", "UP", "I", "RUF"]
+select = ["E", "F", "B", "UP", "I", "RUF", "C"]
 ignore = ["E501"]
 fixable = ["ALL"]
 unfixable = []
+
+[tool.ruff.lint.mccabe]
+# Aksantara's router factory is currently the most complex function (40).
+# This ceiling prevents further growth while the Phase 3 refactor extracts
+# router and legacy-adapter helpers into focused modules.
+max-complexity = 40
 
 [tool.ruff.lint.per-file-ignores]
 "src/aksantara/api/routes.py" = ["B008"]
@@ -108,6 +117,25 @@ addopts = "-q"
 [tool.coverage.run]
 source = ["src"]
 branch = true
+parallel = false
+
+[tool.coverage.report]
+fail_under = 35
+show_missing = true
+skip_covered = false
+precision = 2
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\b",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aksantara"]

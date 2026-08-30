@@ -88,6 +88,51 @@ mise run test
 
 Commands become active as implementation scaffolding lands. Copy `.env.example` to `.env`; `.env` is ignored and must never be committed.
 
+## Interactive QA — Agent-Followable End-to-End
+
+A complete, documented path to bring the app to an interactive state and exercise it. No external credentials required for the in-memory slice (Firestore/Vertex optional).
+
+**Prerequisites:** Python 3.13 via `mise`, `mise` 2026.8.14+, no GCP credentials needed for basic QA (app boots with in-memory fakes and fail-closed semantic).
+
+```bash
+# 1. Install toolchain and deps (one command)
+mise install
+cp .env.example .env  # no edits needed for QA; GCP vars remain empty for in-memory mode
+pip install -e ".[dev]"  # or mise will handle via python venv
+
+# 2. Verify static checks and unit/replay slice
+mise run check   # ruff format --check, ruff check, mypy src
+mise run coverage  # pytest with 35% coverage gate, htmlcov output
+
+# 3. Launch the API (no auth gate — bypass documented: empty .env runs in-memory)
+mise run dev &
+# or: uvicorn aksantara.api.routes:create_app --factory --host 127.0.0.1 --port 8000 --reload
+sleep 3
+curl -s http://127.0.0.1:8000/health | jq
+# -> {"status":"ok","firestore":"not_configured",...}
+
+# 4. Drive meaningful interactions (exact / prefix / semantic / nonstandard / versions)
+curl -s http://127.0.0.1:8000/entries/februari | jq .lema
+curl -s "http://127.0.0.1:8000/entries?q=feb&limit=5" | jq .count
+curl -s "http://127.0.0.1:8000/search/semantic?q=bulan%20kedua&limit=3" | jq .results
+curl -s http://127.0.0.1:8000/relations/nonstandard/Pebruari | jq .standard_form
+curl -s http://127.0.0.1:8000/versions/current | jq .version
+curl -s http://127.0.0.1:8000/docs | head -20  # OpenAPI UI
+
+# 5. Replay and retrieval slice (deterministic, no network)
+mise run replay  # pytest tests/replay -v (Februari fixture, hash 35a702...)
+mise run slice   # replay + retrieval cascade exact→prefix→semantic
+./scripts/qa_smoke.sh  # one-shot smoke: starts ephemeral uvicorn, curls all endpoints, exits 0 on success
+
+# Cleanup
+kill %1; wait %1 2>/dev/null || true
+```
+
+Auth handling: **No login gate.** API is public for QA; semantic search fails closed (empty results) without Vertex credentials, which is expected and documented. To test with live Firestore/Vertex, populate `.env` with `GOOGLE_CLOUD_PROJECT`, `GOOGLE_APPLICATION_CREDENTIALS`, and run `scripts/bootstrap_gcp.sh`.
+
+Mise tasks for QA: `mise run dev`, `mise run qa`, `mise run smoke` — see `mise.toml`.
+
+
 ## Readiness roadmap
 
 - **Level 1, Functional:** runnable setup, pinned dependencies, formatter, linter, type checker, tests, and local replay.

@@ -74,7 +74,7 @@ def quarantine_entry(
     Note:
         Phase 2: in-memory only. Firestore integration will mirror this
         record to `review_queue/{entry_id}_{hash}_{timestamp}` later.
-        TODO(Firestore): add firestore.Client write behind feature flag.
+        TODO(#101): add firestore.Client write behind feature flag — tracked in issue #101, Firestore integration for review_queue.
     """
     # Extract fields from entry if provided
     lema_val: str | None = None
@@ -133,7 +133,7 @@ def quarantine_entry(
     )
     with _lock:
         _REVIEW_QUEUE.append(rec)
-    # TODO(Firestore): if firestore client available and env flag, also write to review_queue collection
+    # TODO(#102): if firestore client available and env flag, also write to review_queue collection — tracked in issue #102.
     return rec
 
 

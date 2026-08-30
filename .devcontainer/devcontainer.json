@@ -1,0 +1,36 @@
+{
+  "name": "Aksantara — KBBI fuel layer",
+  "image": "mcr.microsoft.com/devcontainers/python:3.13-bullseye",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {
+      "version": "latest"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "ms-toolsai.jupyter"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "/usr/local/bin/python",
+        "python.testing.pytestEnabled": true,
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "charliermarsh.ruff"
+      }
+    }
+  },
+  "forwardPorts": [8000, 3000],
+  "portsAttributes": {
+    "8000": {
+      "label": "Pramana API (FastAPI)",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "pip install --upgrade pip && pip install -e \".[dev]\" && pip install coverage[toml] pytest-cov && echo 'devcontainer ready — try: mise run check; mise run qa'",
+  "postStartCommand": "echo 'Aksantara devcontainer — mise install not needed inside (pip path); run: python -m pytest --cov=src --cov-fail-under=35'",
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true
+}

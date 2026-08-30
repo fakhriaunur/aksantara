@@ -11,3 +11,34 @@ repos:
       - id: mypy
         args: [--strict]
         additional_dependencies: [pydantic==2.13.5, types-beautifulsoup4]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=100']
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: check-complexity
+        name: cyclomatic complexity (ruff C901, max 40)
+        entry: ruff check --select C901
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: dead-code-vulture
+        name: dead code detection (vulture)
+        entry: python -m vulture src/ .vulture_whitelist.py --min-confidence 80 --exclude '*__pycache__*'
+        language: system
+        pass_filenames: false
+      - id: duplicate-jscpd
+        name: duplicate code detection (normalized repeated blocks)
+        entry: python scripts/check_duplicate.sh
+        language: system
+        pass_filenames: false
+      - id: tech-debt-todos
+        name: tech debt — TODOs must reference issue
+        entry: bash -c 'if grep -rn "TODO" --include="*.py" src/ | grep -v "TODO(#" | grep -v "TODO(TICKET" | grep -q "TODO"; then echo "Untracked TODO found — use TODO(#123) or TODO(TICKET-123)"; grep -rn "TODO" --include="*.py" src/ | grep -v "TODO(#" | grep -v "TODO(TICKET"; exit 1; fi'
+        language: system
+        pass_filenames: false

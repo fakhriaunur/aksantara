@@ -12,16 +12,56 @@ description = "Run lint, type, and test"
 depends = ["lint", "type", "test"]
 
 [tasks.lint]
-description = "Ruff format check and lint"
-run = "ruff format --check . && ruff check ."
+description = "Ruff format check and lint (includes C901 complexity gate max 40)"
+run = "ruff format --check . && ruff check . && ruff check --select C901 --statistics"
 
 [tasks.type]
 description = "Type check with mypy (strict via config, no duplicate flag)"
 run = "mypy src"
 
+[tasks.complexity]
+description = "Cyclomatic complexity gate (ruff C901, max 40, via mccabe)"
+run = "ruff check --select C901 --statistics && echo 'complexity gate: max 40 (see pyproject.toml [tool.ruff.lint.mccabe])'"
+
+[tasks.large-files]
+description = "Large file detection (700 lines / 150KB, plus LFS via .gitattributes)"
+run = "bash scripts/check_large_files.sh"
+
+[tasks.dead-code]
+description = "Dead code detection (vulture, min-confidence 80, whitelist)"
+run = "python -m vulture src/ .vulture_whitelist.py --min-confidence 80 --exclude '*__pycache__*'"
+
+[tasks.duplicate]
+description = "Duplicate code detection (normalized repeated-block detector)"
+run = "python scripts/check_duplicate.sh"
+
+[tasks.tech-debt]
+description = "Tech debt tracking — TODOs must reference issue (TODO(#123))"
+run = "bash scripts/check_tech_debt.sh"
+
 [tasks.test]
-description = "Run pytest suite"
-run = "pytest"
+description = "Run pytest suite with coverage gate (35% fail_under)"
+run = "pytest --cov=src --cov-report=term-missing --cov-report=html --cov-fail-under=35"
+
+[tasks.test-quick]
+description = "Run pytest without coverage (fast feedback)"
+run = "pytest -q"
+
+[tasks.coverage]
+description = "Coverage report with threshold enforcement"
+run = "pytest --cov=src --cov-report=term-missing --cov-report=html --cov-fail-under=35 && coverage report --show-missing"
+
+[tasks.dev]
+description = "Launch FastAPI Pramana API in-memory (no GCP creds needed) for interactive QA"
+run = "python -m uvicorn aksantara.api.routes:create_app --factory --host 127.0.0.1 --port 8000 --reload"
+
+[tasks.qa]
+description = "Interactive QA: run checks, start dev server, and drive curl smoke (agent-followable)"
+run = "./scripts/qa_smoke.sh"
+
+[tasks.smoke]
+description = "One-shot smoke: ephemeral server + curl all endpoints (no manual cleanup needed)"
+run = "./scripts/qa_smoke.sh --ephemeral"
 
 [tasks.replay]
 description = "Deterministic replay tests"

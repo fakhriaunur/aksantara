@@ -1,0 +1,10 @@
+{
+  "threshold": 5,
+  "reporters": ["console", "html"],
+  "ignore": ["**/__pycache__/**", "**/.venv/**", "**/htmlcov/**", "**/.mypy_cache/**", "**/.ruff_cache/**"],
+  "absolute": false,
+  "gitignore": true,
+  "pattern": "src/**/*.py",
+  "minLines": 5,
+  "minTokens": 50
+}

@@ -42,6 +42,33 @@ Before commit, run the narrowest relevant `mise` tasks for formatting, linting, 
 
 Three bounded agents: Lead Orchestrator, Ingestion, and Retrieval/Normalization. Keep parsing, validation, diffing, embedding, retrieval, and projection generation deterministic. Agents must produce reviewable changes and evidence. Level 1–2 readiness comes first; add Level 3 controls, measure Level 4, and treat Level 5 as a later Transform phase.
 
+## Interactive QA — Agent-Followable Path
+
+Concrete end-to-end QA for an agent (backend/API, no auth gate, no external services required for in-memory slice):
+
+**Deps & services:** `mise install` (Python 3.13.15, pitchfork), `cp .env.example .env` (leave GCP vars empty for in-memory mode), `pip install -e ".[dev]"`. No DB or emulator needed — Firestore/Vertex are optional and app boots `not_configured` via fail-closed.
+
+**Auth:** None. API is public for QA (`/health`, `/docs` require no credentials). Semantic search returns `[]` without Vertex, which is expected.
+
+**Launch:**
+```bash
+mise run dev        # uvicorn aksantara.api.routes:create_app --factory --host 127.0.0.1 --port 8000 --reload
+# or: mise run qa  # one-shot smoke that starts ephemeral server and curls every endpoint
+```
+
+**Drive (meaningful interactions):**
+```bash
+curl -s http://127.0.0.1:8000/health | jq
+curl -s http://127.0.0.1:8000/versions/current | jq .version
+curl -s "http://127.0.0.1:8000/entries?q=feb&limit=5" | jq .count
+curl -s http://127.0.0.1:8000/docs | head  # Swagger UI
+curl -s "http://127.0.0.1:8000/search/semantic?q=bulan%20kedua" | jq
+./scripts/qa_smoke.sh --ephemeral  # full smoke: health, versions, docs, prefix, exact, semantic, nonstandard, replay
+mise run replay && mise run slice
+```
+
+Expected: `GET /health` → `{"status":"ok"}`, `GET /search/semantic` → `{"results":[]}` fail-closed without creds, `GET /entries/februari` → `404` on empty index (seed via `pytest` fixtures). See `README.md#interactive-qa-agent-followable-end-to-end` and `scripts/qa_smoke.sh`.
+
 ## Git workflow
 
 Use conventional commits. Never commit secrets or generated credentials. Review staged diff before committing. Do not push without explicit authorization.

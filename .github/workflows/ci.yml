@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup mise
+        uses: jdx/mise-action@v2
+        with:
+          version: 2026.8.14
+
+      - name: Install toolchain
+        run: mise install
+
+      - name: Lint (ruff, includes C901 complexity max 40)
+        run: mise run lint
+
+      - name: Type check (mypy)
+        run: mise run type
+
+      - name: Complexity gate (ruff C901)
+        run: mise run complexity
+
+      - name: Large file detection (700 lines / 150KB + LFS)
+        run: mise run large-files
+
+      - name: Dead code detection (vulture)
+        run: mise run dead-code
+
+      - name: Duplicate code detection (jscpd/pylint)
+        run: mise run duplicate
+
+      - name: Tech debt tracking (TODO must link to issue)
+        run: mise run tech-debt
+
+      - name: Test with coverage (enforced 35%)
+        run: mise run coverage
+
+      - name: Upload coverage HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov
+          if-no-files-found: ignore
+
+      - name: Coverage summary
+        if: always()
+        run: coverage report --format=markdown >> $GITHUB_STEP_SUMMARY || true
