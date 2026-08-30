@@ -1,0 +1,54 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "vector_entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "source_kind",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "edition",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "embedding_vector",
+          "vectorConfig": {
+            "dimension": 768,
+            "flat": {}
+          }
+        }
+      ]
+    },
+    {
+      "collectionGroup": "entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "source_kind",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "edition",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "lema",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "entries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "lema",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

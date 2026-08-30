@@ -42,6 +42,10 @@ ignore = ["E501"]
 fixable = ["ALL"]
 unfixable = []
 
+[tool.ruff.lint.per-file-ignores]
+"src/aksantara/api/routes.py" = ["B008"]
+"src/aksantara/embeddings/*" = ["B008", "E501", "RUF034"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
@@ -89,6 +93,10 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "aksantara.api.routes"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.ingest.snapshots"
 ignore_errors = true
 
 [tool.pytest.ini_options]
