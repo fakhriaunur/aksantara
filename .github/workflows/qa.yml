@@ -1,0 +1,59 @@
+name: QA
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: qa-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  qa:
+    name: Functional API QA (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Setup mise
+        uses: jdx/mise-action@v2
+        with:
+          version: 2026.8.14
+      - name: Install toolchain
+        run: mise install
+      - name: Install project
+        run: python -m pip install -e '.[dev]'
+      - name: Run functional QA smoke
+        id: qa
+        run: ./scripts/qa_smoke.sh --ephemeral | tee qa-output.txt
+      - name: Upload QA artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-results
+          path: |
+            qa-results/
+            qa-output.txt
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Post QA report
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          body_file=$(mktemp)
+          echo '<!-- qa-report -->' > "$body_file"
+          if [[ -f qa-results/report.md ]]; then cat qa-results/report.md >> "$body_file"; else echo '## QA Report' >> "$body_file"; echo >> "$body_file"; echo ':no_entry: Smoke output:' >> "$body_file"; echo '```text' >> "$body_file"; cat qa-output.txt >> "$body_file"; echo '```' >> "$body_file"; fi
+          echo >> "$body_file"
+          echo '[Download QA artifacts](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})' >> "$body_file"
+          existing=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" --paginate --jq '.[] | select(.body | startswith("<!-- qa-report -->")) | .id' | head -n1 || true)
+          if [[ -n "$existing" ]]; then gh api --method PATCH "repos/${{ github.repository }}/issues/comments/$existing" -F body="$(cat "$body_file")"; else gh api --method POST "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" -F body="$(cat "$body_file")"; fi

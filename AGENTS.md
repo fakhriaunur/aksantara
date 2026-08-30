@@ -13,6 +13,10 @@ Aksantara is a KBBI-first Indonesian language-data fuel layer. KBBI is the sole 
 - `docs/`: architecture, authority, source, downstream, and readiness docs.
 - `triage/`: event worksheet and execution record.
 
+## File editing
+
+Do not use the ApplyPatch tool. Use edit, multiedit, create, or bounded Python/shell scripts for file changes.
+
 ## Tooling contract
 
 Use **mise** as project toolchain and task runner. Pin runtime and dependency versions in project configuration; prefer `mise run <task>` over ad-hoc commands.

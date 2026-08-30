@@ -1,0 +1,37 @@
+project: Aksantara
+platform: github
+imagemagick: false
+video_evidence: false
+environments:
+  local_ephemeral:
+    url: http://127.0.0.1:8000
+    restrictions: [read-only, no persistent data, no external services]
+default_target: local_ephemeral
+auth:
+  method: none
+  provider: none
+personas:
+  - name: anonymous
+    description: Public unauthenticated API consumer
+    credentials_source: none
+    test_focus: [health, versions, lookup, semantic fail-closed, replay]
+    cannot_do: [mutate canonical data, access credentials]
+apps:
+  backend:
+    path_patterns: ["src/**", "scripts/**", "tests/**", "infra/**"]
+    skill: qa-backend
+    test_tool: curl
+    build_command: "pip install -e '.[dev]'"
+feature_flags:
+  provider: none
+  dashboard_url: ""
+  how_to_override: "No feature flags detected."
+integrations:
+  gcp:
+    provider: Google Cloud Vertex AI, Firestore, and Cloud Storage
+    mode: Optional; local QA must remain in-memory and fail-closed
+cleanup:
+  auto_cleanup: true
+  strategy: none
+  instructions: "QA uses an ephemeral local server and temporary files only; trap cleanup terminates the server and removes its temporary directory."
+failure_learning: suggest_in_report
