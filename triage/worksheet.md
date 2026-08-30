@@ -73,7 +73,7 @@ notes: >-
 > invented zeros.
 
 **Event:** All Things Agentic  **Dates:** 2026-08-04 → 2026-09-01  **Format:** solo ☒ team ☐
-**Total your-hours available:** 40 h  *(portfolio reservation)*
+**Total your-hours available:** 40 h  *(portfolio reservation; Level 1–2 first, then progressive Level 3–4 readiness)*
 **Event link / rubric URL:** https://allthingsagentichackathon.devpost.com
 
 ---
@@ -108,6 +108,7 @@ notes: >-
 - [ ] Auth/deploy scaffold ready at: __________
 - [ ] Demo recording setup tested
 - [ ] Stack frozen at **4–5 technologies**: 1 Gemini 2 Google agent framework 3 Google Cloud 4 app UI 5 logging/observability
+- [ ] Vector decision recorded: Vertex AI embeddings + Firestore vector search; SurrealDB, Milvus, and Vertex AI Vector Search deferred pending measured scale evidence
 
 ---
 
@@ -197,6 +198,13 @@ idempotent sync; no silent source overwrite; unresolved conflicts quarantined;
 embeddings reference exact canonical hashes; unknown semantic queries fail
 closed; downstream artifacts include source and generator manifests.
 
+**Embedding implementation:** Vertex AI generates embeddings; Firestore stores
+canonical records and vector fields and performs KNN search. Firestore does not
+generate embeddings. Exact and prefix lookup precede vector retrieval. Record
+model, dimensions, distance measure, and content hash; re-embed only changed
+records. Keep `EmbeddingStore` behind an interface so a measured future need
+can move to Vertex AI Vector Search, Milvus, or SurrealDB.
+
 ## Main pipeline
 
 `INV -> SCHEMA -> FETCH -> PARSE -> VALIDATE -> SLICE -> FULL -> EMBED ->
@@ -213,6 +221,7 @@ Use three agents: **Lead Orchestrator** for lifecycle and policy, **Ingestion**
 for fetching and raw snapshots, and **Retrieval/Normalization** for embedding
 preparation and anomaly proposals. Keep parser, validator, publisher, diff,
 embedding, retrieval, and projection generation deterministic functions.
+Vertex AI is the embedding provider; Firestore is the initial vector backend.
 
 ## Separate downstream tracks
 
@@ -231,7 +240,8 @@ No downstream track may mutate canonical KBBI records.
 Embed only validated KBBI `lema`, meanings, examples, labels, and relations
 through **Aksantara Pramana**, the semantic retrieval layer.
 Each vector stores `entry_id`, `source_version`, `content_hash`, model,
-dimensions, and schema version. Exact and prefix lookup run first. Semantic
+dimensions, distance measure, and schema version. Vertex AI generates vectors;
+Firestore stores and searches them. Exact and prefix lookup run first. Semantic
 results return KBBI records and citations. Unknown or weak matches return no
 authoritative result. Generic corpora may occupy a separate enrichment
 namespace for context or frequency, never correction decisions.
@@ -240,7 +250,7 @@ namespace for context or frequency, never correction decisions.
 
 | Block | % of hours | Hours | Output |
 |---|---|---|---|
-| Skeleton (end-to-end thinnest path) | first 25% | 10 | Gemini + ADK + Cloud path, one official fixture, one embedding |
+| Skeleton (end-to-end thinnest path) | first 25% | 10 | Gemini + ADK + Cloud path, one official fixture, one Vertex embedding in Firestore |
 | Core features (max 2–3 must-haves) | 25→60% | 20 | resumable full-corpus path, canonical store, KBBI-only retrieval |
 | Polish + submission artifacts | last 15%+slack | 10 | provenance UI, manifests, README, diagram, video, proof |
 
@@ -250,7 +260,26 @@ with citations and fail-closed unknowns; exact and semantic lookup; stable
 downstream projection manifest.
 Explicitly NOT building in this ticket: Hunspell/LibreOffice, cspell, Babel,
 Polyglossia, Rabu Baku, stenotype, generic-corpus RAG, full grammar correction,
-or CockroachDB dependency.
+SurrealDB, Milvus, Vertex AI Vector Search migration, or CockroachDB dependency.
+
+## Agent readiness progression
+
+Factory readiness target: begin at Levels 1–2, establish Level 3 controls,
+progressively measure Level 4, and treat Level 5 as a later Transform phase.
+Factory requires 80% of a level's criteria before unlocking the next level.
+
+| Level | Aksantara evidence |
+|---|---|
+| 1 Functional | README, pinned dependencies, formatter, linter, type checker, unit tests, local replay |
+| 2 Documented | project `AGENTS.md`, setup/deploy/debug docs, authority policy, pre-commit, ownership boundaries |
+| 3 Standardized | CI, integration/replay tests, secret/dependency scans, structured logs, run/trace IDs, human review ownership |
+| 4 Optimized | cached fast CI, failure/flaky metrics, freshness/parser/vector cost dashboards, rollback and deployment metrics |
+| 5 Autonomous | structured task discovery, bounded agent decomposition, least privilege, reviewable changes, deterministic gates, recovery and self-improving estimates |
+
+Run `/readiness-report` after the repository has an `origin` remote and
+Level 1–2 foundation. Use `/readiness-fix` only with explicit scope, review
+every change, run validation, commit intentionally, and rerun the report.
+Level 5 must not be claimed from agent count alone.
 
 ## Checkpoint tracker (check honestly, on the clock)
 
