@@ -1,0 +1,32 @@
+min_version = "2026.8.14"
+
+[tools]
+python = "3.13.15"
+pitchfork = "2.23.0"
+
+[env]
+PYTHONPATH = "src"
+
+[tasks.check]
+description = "Run lint, type, and test"
+depends = ["lint", "type", "test"]
+
+[tasks.lint]
+description = "Ruff format check and lint"
+run = "ruff format --check . && ruff check ."
+
+[tasks.type]
+description = "Type check with mypy strict"
+run = "mypy --strict src"
+
+[tasks.test]
+description = "Run pytest suite"
+run = "pytest"
+
+[tasks.replay]
+description = "Deterministic replay tests"
+run = "pytest tests/replay -v"
+
+[tasks.slice]
+description = "Februari slice smoke (replay + retrieval)"
+run = "pytest tests/replay tests/retrieval -v"

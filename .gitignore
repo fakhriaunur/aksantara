@@ -6,6 +6,7 @@
 *.key
 credentials*.json
 service-account*.json
+.mise.local.toml
 
 # Dependencies
 node_modules/
@@ -26,3 +27,11 @@ coverage/
 .cache/
 tmp/
 *.log
+data/
+manifests/
+.mise/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
