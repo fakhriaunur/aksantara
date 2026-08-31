@@ -88,6 +88,28 @@ mise run test
 
 Commands become active as implementation scaffolding lands. Copy `.env.example` to `.env`; `.env` is ignored and must never be committed.
 
+## Deterministic 100-key checkpoint
+
+The Phase 3 checkpoint driver accepts a caller-owned catalog and fixture
+transport manifest. It normalizes and sorts stable keys, enforces the
+`1..100` limit domain, hashes source-reference identity, and writes durable
+run/report/checkpoint artifacts only below the requested root. Local mode makes
+no live network, GCP, emulator, or release-pointer calls:
+
+```bash
+python scripts/checkpoint.py --help
+python scripts/checkpoint.py contract --json
+python scripts/checkpoint.py preflight --root /tmp/aksantara-checkpoint --catalog catalog.json --limit 100 --json
+python scripts/checkpoint.py run --root /tmp/aksantara-checkpoint --catalog catalog.json --limit 100 --idempotency-key demo --json
+python scripts/checkpoint.py status --root /tmp/aksantara-checkpoint --run-id checkpoint-<fingerprint> --json
+python scripts/checkpoint.py report --root /tmp/aksantara-checkpoint --run-id checkpoint-<fingerprint> --json
+```
+
+The complete catalog schema, fingerprint preimages, lifecycle, error mapping,
+and FastAPI `/checkpoints/*` operations are documented in
+[`docs/checkpoint-driver.md`](docs/checkpoint-driver.md). An accepted
+checkpoint is evidence only, never an implicit candidate or release.
+
 ## Interactive QA — Agent-Followable End-to-End
 
 A complete, documented path to bring the app to an interactive state and exercise it. No external credentials required for the in-memory slice (Firestore/Vertex optional).

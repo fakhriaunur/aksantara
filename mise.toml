@@ -67,6 +67,10 @@ run = "./scripts/qa_smoke.sh --ephemeral"
 description = "Deterministic replay tests"
 run = "pytest tests/replay -v"
 
+[tasks.checkpoint-help]
+description = "Print the deterministic local checkpoint contract"
+run = "python scripts/checkpoint.py --help"
+
 [tasks.slice]
 description = "Februari slice smoke (replay + retrieval)"
 run = "pytest tests/replay tests/retrieval -v"
