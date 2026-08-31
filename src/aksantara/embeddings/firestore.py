@@ -15,6 +15,7 @@ import logging
 import math
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,7 @@ DEFAULT_DIMS: int = 768
 DEFAULT_DISTANCE_MEASURE: str = "DOT_PRODUCT"
 DEFAULT_DISTANCE_THRESHOLD: float = 0.70
 DEFAULT_DISTANCE_RESULT_FIELD: str = "vector_distance"
+FIRESTORE_BATCH_LIMIT: int = 500
 VECTOR_FIELD: str = "embedding_vector"
 VECTOR_COLLECTION: str = "vector_entries"
 ENTRIES_COLLECTION: str = "entries"
@@ -39,6 +41,7 @@ __all__ = [
     "DEFAULT_DISTANCE_RESULT_FIELD",
     "DEFAULT_DISTANCE_THRESHOLD",
     "ENTRIES_COLLECTION",
+    "FIRESTORE_BATCH_LIMIT",
     "VECTOR_COLLECTION",
     "VECTOR_FIELD",
     "EmbeddingStore",
@@ -167,6 +170,10 @@ class EmbeddingStore(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def put_many(self, records: Iterable[VectorRecord]) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    @abstractmethod
     def find_nearest(
         self,
         query_vector: list[float],
@@ -201,6 +208,56 @@ def _unwrap_vector(value: Any) -> list[float]:
     return []
 
 
+def _record_doc_id(record: VectorRecord) -> str:
+    """Return stable Firestore document ID, rejecting records without an ID."""
+    if not (record.id or record.entry_id):
+        raise ValueError("vector record requires id or entry_id")
+    return record.doc_id or record.entry_id or record.id
+
+
+def _record_fingerprint(record: VectorRecord) -> dict[str, Any]:
+    """Return immutable record fields for duplicate/conflict detection."""
+    payload = record.to_firestore_dict()
+    # Timestamps are write metadata, not vector identity. A rebuilt record for
+    # the same version/content must remain idempotent across process runs.
+    payload.pop("created_at", None)
+    payload.pop("updated_at", None)
+    return payload
+
+
+def _deduplicate_records(records: Iterable[VectorRecord]) -> list[VectorRecord]:
+    """Keep identical records once and reject conflicting duplicate IDs."""
+    unique: list[VectorRecord] = []
+    seen: dict[str, dict[str, Any]] = {}
+    for record in records:
+        doc_id = _record_doc_id(record)
+        fingerprint = _record_fingerprint(record)
+        previous = seen.get(doc_id)
+        if previous is not None:
+            if previous != fingerprint:
+                raise ValueError(f"conflicting records for document id {doc_id!r}")
+            continue
+        seen[doc_id] = fingerprint
+        unique.append(record)
+    return unique
+
+
+def _record_payload(record: VectorRecord) -> dict[str, Any]:
+    """Build Firestore payload and wrap vector fields with SDK ``Vector``."""
+    payload = record.to_firestore_dict()
+    vec_list = record.vector_as_list()
+    try:
+        from google.cloud.firestore_v1.vector import (
+            Vector,  # type: ignore[import-not-found]
+        )
+
+        payload[VECTOR_FIELD] = Vector(vec_list)
+        payload["embedding"] = Vector(vec_list)
+    except Exception:
+        payload[VECTOR_FIELD] = _wrap_vector(vec_list)
+    return payload
+
+
 class InMemoryVectorStore(EmbeddingStore):
     """Brute-force KNN for offline tests — supports both distance semantics."""
 
@@ -209,8 +266,21 @@ class InMemoryVectorStore(EmbeddingStore):
         self.distance_measure = distance_measure
 
     def put(self, record: VectorRecord) -> None:
-        key = record.doc_id or record.entry_id or record.id
-        self._store[key] = record
+        self.put_many((record,))
+
+    def put_many(self, records: Iterable[VectorRecord]) -> None:
+        unique = _deduplicate_records(records)
+        for record in unique:
+            key = _record_doc_id(record)
+            existing = self._store.get(key)
+            if existing is not None and _record_fingerprint(
+                existing
+            ) != _record_fingerprint(record):
+                raise ValueError(f"conflicting records for document id {key!r}")
+        for record in unique:
+            key = _record_doc_id(record)
+            if key not in self._store:
+                self._store[key] = record
 
     def _distance(self, a: list[float], b: list[float]) -> float:
         if self.distance_measure == "EUCLIDEAN":
@@ -373,35 +443,43 @@ class FirestoreVectorStore(EmbeddingStore):
         if client is None:
             self._fallback.put(record)
             return
-        # Firestore path
-        doc_id = record.doc_id
-        try:
-            from google.cloud.firestore_v1.vector import (
-                Vector,  # type: ignore[import-not-found]
-            )
-
-            VectorCls = Vector
-        except Exception:
-            VectorCls = None  # type: ignore[assignment]
-
-        doc_ref = client.collection(self.collection).document(doc_id)
-        payload = record.to_firestore_dict()
-        # Wrap vector field for SDK
-        vec_list = record.vector_as_list()
-        if VectorCls is not None:
-            try:
-                payload[VECTOR_FIELD] = VectorCls(vec_list)
-                payload["embedding"] = VectorCls(vec_list)
-            except Exception:
-                payload[VECTOR_FIELD] = vec_list
-        else:
-            payload[VECTOR_FIELD] = _wrap_vector(vec_list)
-        # Preserve spec Vector wrapper as well
+        doc_ref = client.collection(self.collection).document(_record_doc_id(record))
+        payload = _record_payload(record)
+        # Preserve existing single-write merge semantics for compatibility.
         try:
             doc_ref.set(payload, merge=True)
         except Exception:
             # fallback to in-memory on error
             self._fallback.put(record)
+
+    def put_many(self, records: Iterable[VectorRecord]) -> None:
+        """Persist vector records in Firestore write batches.
+
+        Identical records sharing a deterministic document ID are collapsed so
+        retries are idempotent. Conflicting records are rejected before any
+        write, preventing an accidental same-version overwrite.
+        """
+        unique = _deduplicate_records(records)
+        if not unique:
+            return
+
+        for record in unique:
+            self._assert_record(record)
+
+        client = self._get_client()
+        if client is None:
+            self._fallback.put_many(unique)
+            return
+
+        collection = client.collection(self.collection)
+        for start in range(0, len(unique), FIRESTORE_BATCH_LIMIT):
+            batch = client.batch()
+            for record in unique[start : start + FIRESTORE_BATCH_LIMIT]:
+                doc_ref = collection.document(_record_doc_id(record))
+                batch.set(doc_ref, _record_payload(record), merge=True)
+            # Do not fall back silently: callers must observe persistence
+            # failures rather than treating an uncommitted release as written.
+            batch.commit()
 
     def get(self, doc_id: str) -> VectorRecord | None:
         client = self._get_client()
