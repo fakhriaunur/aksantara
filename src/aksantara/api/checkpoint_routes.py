@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,8 +23,18 @@ from aksantara.ingest.checkpoint import (
     CheckpointError,
     CheckpointNotFoundError,
 )
+from aksantara.validate.review import (
+    ReviewDecisionConflictError,
+    ReviewError,
+    ReviewNotFoundError,
+)
 
-__all__ = ["CheckpointCreateRequest", "create_checkpoint_router"]
+__all__ = [
+    "CandidateEvaluationRequest",
+    "CheckpointCreateRequest",
+    "ReviewDecisionRequest",
+    "create_checkpoint_router",
+]
 
 
 class CheckpointCreateRequest(BaseModel):
@@ -58,12 +68,79 @@ class CheckpointCreateRequest(BaseModel):
     )
 
 
+class ReviewDecisionRequest(BaseModel):
+    """Explicit local operator decision for one review record."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    root: str = Field(
+        min_length=1,
+        description="Caller-owned root containing the durable review record",
+    )
+    decision: Literal["select_official", "block", "reject"] = Field(
+        description="One of select_official, block, or reject",
+    )
+    reviewer: str = Field(min_length=1, description="Human reviewer identity")
+    reason: str = Field(min_length=1, description="Reason retained in history")
+    policy_version: str = Field(
+        min_length=1,
+        description="Policy pin used for this decision",
+    )
+    idempotency_key: str | None = Field(
+        default=None,
+        description="Repeat-safe decision key",
+    )
+    timestamp: str | None = Field(
+        default=None,
+        description="Optional fixed ISO-8601 timestamp for deterministic fixtures",
+    )
+
+
+class CandidateEvaluationRequest(BaseModel):
+    """Candidate gate request, including optional release-level approval."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    root: str = Field(
+        min_length=1,
+        description="Caller-owned root containing the checkpoint artifacts",
+    )
+    release_approved: bool = Field(
+        default=False,
+        description="Explicit release-level human approval; never implicit",
+    )
+    release_reviewer: str | None = Field(
+        default=None,
+        description="Human approver identity",
+    )
+    release_reason: str | None = Field(
+        default=None,
+        description="Reason retained with the candidate approval",
+    )
+
+
 _drivers: dict[tuple[str, str], CheckpointDriver] = {}
 _drivers_lock = threading.RLock()
 
 
 def _error_response(error: CheckpointError) -> HTTPException:
     return HTTPException(status_code=error.status_code, detail=error.to_dict())
+
+
+def _review_error_response(error: ReviewError) -> HTTPException:
+    if isinstance(error, ReviewNotFoundError):
+        status_code = 404
+        code = "review_not_found"
+    elif isinstance(error, ReviewDecisionConflictError):
+        status_code = 409
+        code = "review_decision_conflict"
+    else:
+        status_code = 422
+        code = "invalid_review_request"
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": str(error)},
+    )
 
 
 def _load_catalog(request: CheckpointCreateRequest, root: Path) -> dict[str, Any]:
@@ -286,6 +363,130 @@ def create_checkpoint_router() -> APIRouter:
     ) -> dict[str, Any]:
         try:
             return _driver_for(run_id, root).checkpoint(run_id)
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+
+    @router.get(
+        "/reviews",
+        summary="Read deterministic open authority review queue",
+        operation_id="checkpoint_review_queue",
+        response_model=dict[str, Any],
+        description=(
+            "Local-only read from a caller-owned root. Results are sorted by "
+            "stable key and review ID and include immutable source evidence."
+        ),
+    )
+    def review_queue(
+        root: str = Query(..., description="Caller-owned review artifact root"),
+    ) -> dict[str, Any]:
+        try:
+            records = CheckpointDriver(
+                root=Path(root).expanduser().resolve()
+            ).review_queue()
+            return {
+                "schema_version": "authority-review-v1",
+                "count": len(records),
+                "reviews": records,
+            }
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+        except ReviewError as exc:
+            raise _review_error_response(exc) from exc
+
+    @router.get(
+        "/reviews/{review_id}",
+        summary="Read one authority review record",
+        operation_id="checkpoint_review_read",
+        response_model=dict[str, Any],
+    )
+    def review_read(
+        review_id: str,
+        root: str = Query(..., description="Caller-owned review artifact root"),
+    ) -> dict[str, Any]:
+        try:
+            return CheckpointDriver(root=Path(root).expanduser().resolve()).review_read(
+                review_id
+            )
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+        except ReviewError as exc:
+            raise _review_error_response(exc) from exc
+
+    @router.post(
+        "/reviews/{review_id}/decisions",
+        summary="Append an explicit authority review decision",
+        operation_id="checkpoint_review_decision",
+        response_model=dict[str, Any],
+        description=(
+            "Local-only mutation in a caller-owned root. Decisions are "
+            "append-only and idempotent by idempotency_key. select_official "
+            "never selects a fallback source."
+        ),
+    )
+    def review_decision(
+        review_id: str,
+        request: ReviewDecisionRequest,
+    ) -> dict[str, Any]:
+        try:
+            return CheckpointDriver(
+                root=Path(request.root).expanduser().resolve()
+            ).review_decide(
+                review_id,
+                decision=request.decision,
+                reviewer=request.reviewer,
+                reason=request.reason,
+                policy_version=request.policy_version,
+                idempotency_key=request.idempotency_key,
+                timestamp=request.timestamp,
+            )
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+        except ReviewError as exc:
+            raise _review_error_response(exc) from exc
+
+    @router.post(
+        "/runs/{run_id}/candidate",
+        summary="Evaluate checkpoint candidate eligibility",
+        operation_id="checkpoint_candidate_evaluate",
+        response_model=dict[str, Any],
+        description=(
+            "Local-only fail-closed candidate gate. It requires exact "
+            "official source, raw/canonical joins, terminal outcomes, "
+            "resolved item reviews, a complete fixed checkpoint, and an "
+            "explicit release-level approval. It never changes the current "
+            "release pointer or creates vectors."
+        ),
+    )
+    def candidate_evaluate(
+        run_id: str,
+        request: CandidateEvaluationRequest,
+    ) -> dict[str, Any]:
+        try:
+            return CheckpointDriver(
+                root=Path(request.root).expanduser().resolve()
+            ).evaluate_candidate(
+                run_id,
+                release_approved=request.release_approved,
+                release_reviewer=request.release_reviewer,
+                release_reason=request.release_reason,
+            )
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+
+    @router.get(
+        "/runs/{run_id}/candidate",
+        summary="Read candidate eligibility evaluation",
+        operation_id="checkpoint_candidate_read",
+        response_model=dict[str, Any],
+    )
+    def candidate_read(
+        run_id: str,
+        root: str = Query(..., description="Caller-owned checkpoint artifact root"),
+    ) -> dict[str, Any]:
+        try:
+            return CheckpointDriver(
+                root=Path(root).expanduser().resolve()
+            ).candidate_evaluation(run_id)
         except CheckpointError as exc:
             raise _error_response(exc) from exc
 

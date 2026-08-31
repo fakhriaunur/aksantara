@@ -25,12 +25,9 @@ from aksantara.ingest.checkpoint_types import (
     _HASH_RE,
     _OFFICIAL_HOSTS,
     _OFFICIAL_SOURCE_KINDS,
-    AUTHORITY_POLICY_VERSION,
-    COMPARISON_POLICY_VERSION,
     DEFAULT_LIMIT,
     MAX_KEY_LENGTH,
     MAX_LIMIT,
-    TRANSFORM_VERSION,
     CatalogValidationError,
     LimitValidationError,
     _CatalogRecord,
@@ -436,172 +433,161 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
     return result
 
 
+def _observation_dict(
+    payload: object,
+    *,
+    root: Path,
+    stable_key: str,
+    default_role: str = "evidence",
+) -> dict[str, Any]:
+    """Parse one additional official/fallback observation binding."""
+    if not isinstance(payload, Mapping):
+        raise CatalogValidationError(
+            "observation must be an object",
+            details={"stable_key": stable_key},
+        )
+    role = _string_value(
+        payload,
+        "role",
+        "observation_role",
+        "observationRole",
+        required=False,
+        default=default_role,
+    )
+    if role is None:
+        role = default_role
+    source_payload = payload.get(
+        "source_ref",
+        payload.get("sourceRef", payload.get("source")),
+    )
+    source_ref = _parse_source_ref(source_payload, stable_key)
+    if role not in {"official", "fallback", "evidence"}:
+        raise CatalogValidationError(
+            "observation role must be official, fallback, or evidence",
+            details={"stable_key": stable_key, "role": role},
+        )
+    if role == "official" and source_ref.source_kind not in {
+        "official-live",
+        "official-snapshot",
+    }:
+        raise CatalogValidationError(
+            "a lower-authority observation cannot be labelled official",
+            details={
+                "stable_key": stable_key,
+                "source_kind": source_ref.source_kind,
+            },
+        )
+    if source_ref.source_kind in {"official-live", "official-snapshot"}:
+        role = "official"
+    transport_payload = payload.get(
+        "transport",
+        payload.get("fixture", payload.get("snapshot")),
+    )
+    if transport_payload is None and any(
+        key in payload for key in ("raw_bytes", "bytes", "content", "base64", "path")
+    ):
+        transport_payload = {
+            key: payload[key]
+            for key in ("raw_bytes", "bytes", "content", "base64", "path")
+            if key in payload
+        }
+        transport_payload["adapter"] = "fixture"
+    transport = _transport_dict(transport_payload, root, stable_key)
+    expected = transport["expected_raw_hash"]
+    if expected and expected != source_ref.content_hash:
+        raise CatalogValidationError(
+            "observation source_ref.content_hash and expected_raw_hash differ",
+            details={
+                "stable_key": stable_key,
+                "source_ref_hash": source_ref.content_hash,
+                "expected_raw_hash": expected,
+            },
+        )
+    transport_public: dict[str, Any] = {
+        key: value for key, value in transport.items() if key != "bytes"
+    }
+    if "bytes" in transport:
+        transport_public["binding"] = "inline-immutable-bytes"
+    return {
+        "role": role,
+        "source_ref": source_ref,
+        "source_identity": {
+            "url": source_ref.url,
+            "source_kind": source_ref.source_kind,
+            "edition": source_ref.edition,
+            "source_version": source_ref.source_version,
+            "content_hash": source_ref.content_hash,
+            "parser_version": source_ref.parser_version,
+        },
+        "transport": transport,
+        "transport_public": transport_public,
+    }
+
+
+def _additional_observations(
+    raw_record: Mapping[str, Any],
+    *,
+    root: Path,
+    stable_key: str,
+) -> tuple[dict[str, Any], ...]:
+    """Read optional paired observations and retain their caller bindings."""
+    raw_value: object = raw_record.get(
+        "observations",
+        raw_record.get("sources", raw_record.get("evidence")),
+    )
+    if raw_value is None:
+        # A compact manifest may use explicit official/fallback blocks.
+        compact: list[tuple[str, object]] = []
+        for name in ("official", "fallback"):
+            if name in raw_record:
+                compact.append((name, raw_record[name]))
+        raw_items: list[tuple[str, object]] = compact
+    elif isinstance(raw_value, Mapping):
+        raw_items = [(str(key), value) for key, value in raw_value.items()]
+    elif isinstance(raw_value, list):
+        raw_items = [(str(index), value) for index, value in enumerate(raw_value)]
+    else:
+        raise CatalogValidationError(
+            "observations must be an array or object",
+            details={"stable_key": stable_key},
+        )
+    observations: list[dict[str, Any]] = []
+    for default_role, payload in raw_items:
+        observations.append(
+            _observation_dict(
+                payload,
+                root=root,
+                stable_key=stable_key,
+                default_role=default_role
+                if default_role in {"official", "fallback"}
+                else "evidence",
+            )
+        )
+    source_identities = [
+        (
+            observation["source_ref"].source_kind,
+            observation["source_ref"].content_hash,
+            observation["source_ref"].url,
+        )
+        for observation in observations
+    ]
+    if len(source_identities) != len(set(source_identities)):
+        raise CatalogValidationError(
+            "observations contain duplicate source references",
+            details={"stable_key": stable_key},
+        )
+    return tuple(observations)
+
+
 def _catalog_records(
     catalog: Mapping[str, Any],
     *,
     root: Path,
 ) -> tuple[str, str, tuple[_CatalogRecord, ...], dict[str, Any]]:
-    catalog_id = _string_value(catalog, "catalog_id", "catalogId", "id")
-    corpus_version = _string_value(
-        catalog,
-        "corpus_version",
-        "corpusVersion",
-    )
-    if catalog_id is None or corpus_version is None:
-        raise CatalogValidationError("catalog identity is incomplete")
-    if _CONTROL_RE.search(catalog_id) or _CONTROL_RE.search(corpus_version):
-        raise CatalogValidationError("catalog identity contains a control character")
-    entries_value = catalog.get("entries", catalog.get("records", catalog.get("items")))
-    if not isinstance(entries_value, list):
-        raise CatalogValidationError(
-            "catalog.entries must be an array",
-            details={"field": "entries"},
-        )
-    pins_value = catalog.get("pins", {})
-    if pins_value is None:
-        pins_value = {}
-    if not isinstance(pins_value, Mapping):
-        raise CatalogValidationError("catalog.pins must be an object")
-    parser_pin = _string_value(
-        pins_value,
-        "parser_version",
-        "parserVersion",
-        required=False,
-        default=PARSER_VERSION,
-    )
-    transform_pin = _string_value(
-        pins_value,
-        "transform_version",
-        "transformVersion",
-        required=False,
-        default=TRANSFORM_VERSION,
-    )
-    validation_policy = _string_value(
-        pins_value,
-        "validation_policy",
-        "validationPolicy",
-        required=False,
-        default=AUTHORITY_POLICY_VERSION,
-    )
-    if parser_pin != PARSER_VERSION:
-        raise CatalogValidationError(
-            "catalog parser pin does not match the installed parser",
-            details={"expected": PARSER_VERSION, "actual": parser_pin},
-        )
-    if transform_pin != TRANSFORM_VERSION:
-        raise CatalogValidationError(
-            "catalog transform pin is not supported",
-            details={"expected": TRANSFORM_VERSION, "actual": transform_pin},
-        )
-    if validation_policy != AUTHORITY_POLICY_VERSION:
-        raise CatalogValidationError(
-            "catalog validation policy is not supported",
-            details={"expected": AUTHORITY_POLICY_VERSION, "actual": validation_policy},
-        )
-    records: list[_CatalogRecord] = []
-    seen: dict[str, int] = {}
-    for ordinal, raw_record in enumerate(entries_value):
-        if not isinstance(raw_record, Mapping):
-            raise CatalogValidationError(
-                "catalog entry must be an object",
-                details={"ordinal": ordinal},
-            )
-        raw_key = _string_value(
-            raw_record,
-            "stable_key",
-            "stableKey",
-            "key",
-            "id",
-            "lema",
-        )
-        if raw_key is None:
-            raise CatalogValidationError("catalog entry has no stable key")
-        stable_key = normalize_stable_key(raw_key)
-        if stable_key in seen:
-            raise CatalogValidationError(
-                "normalized stable_key collision",
-                details={
-                    "stable_key": stable_key,
-                    "first_ordinal": seen[stable_key],
-                    "second_ordinal": ordinal,
-                },
-            )
-        seen[stable_key] = ordinal
-        source_payload = raw_record.get(
-            "source_ref",
-            raw_record.get("sourceRef", raw_record.get("source")),
-        )
-        source_ref = _parse_source_ref(source_payload, stable_key)
-        transport_payload = raw_record.get(
-            "transport",
-            raw_record.get("fixture", raw_record.get("snapshot")),
-        )
-        if transport_payload is None and any(
-            key in raw_record for key in ("raw_bytes", "bytes", "content", "base64")
-        ):
-            transport_payload = {
-                key: raw_record[key]
-                for key in ("raw_bytes", "bytes", "content", "base64")
-                if key in raw_record
-            }
-            transport_payload["adapter"] = "fixture"
-        transport = _transport_dict(transport_payload, root, stable_key)
-        expected = transport["expected_raw_hash"]
-        if expected and expected != source_ref.content_hash:
-            raise CatalogValidationError(
-                "source_ref.content_hash and expected_raw_hash differ",
-                details={
-                    "stable_key": stable_key,
-                    "source_ref_hash": source_ref.content_hash,
-                    "expected_raw_hash": expected,
-                },
-            )
-        records.append(
-            _CatalogRecord(
-                stable_key=stable_key,
-                source_ref=source_ref,
-                transport=transport,
-                ordinal=ordinal,
-            )
-        )
-    policy_inputs = {
-        "authority_mode": _string_value(
-            catalog,
-            "authority_mode",
-            "authorityMode",
-            required=False,
-            default="official-first",
-        ),
-        "comparison_mode": _string_value(
-            catalog,
-            "comparison_mode",
-            "comparisonMode",
-            required=False,
-            default=COMPARISON_POLICY_VERSION,
-        ),
-    }
-    if policy_inputs["authority_mode"] != "official-first":
-        raise CatalogValidationError(
-            "only official-first authority mode is supported",
-            details={"authority_mode": policy_inputs["authority_mode"]},
-        )
-    if policy_inputs["comparison_mode"] not in {
-        COMPARISON_POLICY_VERSION,
-        "exact",
-        "sha256",
-    }:
-        raise CatalogValidationError(
-            "comparison policy is not supported",
-            details={"comparison_mode": policy_inputs["comparison_mode"]},
-        )
-    metadata = {
-        "parser_version": parser_pin,
-        "transform_version": transform_pin,
-        "validation_policy": validation_policy,
-        "authority_mode": policy_inputs["authority_mode"],
-        "comparison_policy": policy_inputs["comparison_mode"],
-    }
-    return catalog_id, corpus_version, tuple(records), metadata
+    """Assemble validated catalog records behind a focused module seam."""
+    from aksantara.ingest.checkpoint_catalog_records import catalog_records
+
+    return catalog_records(catalog, root=root)
 
 
 select_checkpoint = selection_keys

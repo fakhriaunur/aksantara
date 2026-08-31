@@ -7,13 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from aksantara.domain.errors import QuarantinedError, ValidationError
-from aksantara.domain.provenance import canonical_json_hash, content_hash_bytes
-from aksantara.ingest.checkpoint_catalog import normalize_stable_key
+from aksantara.ingest.checkpoint_record import process_record
 from aksantara.ingest.checkpoint_storage import (
     _redact_catalog_request,
     _safe_relative,
-    _write_immutable,
     _write_json,
     _write_state_json,
 )
@@ -29,8 +26,6 @@ from aksantara.ingest.checkpoint_types import (
     RunResult,
     _CatalogRecord,
 )
-from aksantara.parse.parser_contract import ParserError, parse_kbbi
-from aksantara.validate.schema import validate_entry
 
 
 class CheckpointExecutionMixin:
@@ -266,221 +261,14 @@ class CheckpointExecutionMixin:
         )
 
     def _process_record(
-        self,
+        self: Any,
         record: _CatalogRecord,
         run_dir: Path,
         selected_index: int,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        transport = record.transport
-        base_attempt: dict[str, Any] = {
-            "stable_key": record.stable_key,
-            "selected_index": selected_index,
-            "attempt": 1,
-            "transport_attempt": 1,
-            "validation_attempt": 0,
-            "adapter": transport["adapter"],
-            "status": transport["status"],
-            "retry_decision": False,
-            "outcome": "pending",
-        }
-        if transport["status"] == 429 or transport["status"] >= 500:
-            reason = f"fixture transport status {transport['status']}"
-            base_attempt.update(
-                {
-                    "retry_decision": True,
-                    "outcome": "retryable",
-                    "error": {"code": "transport_retryable", "message": reason},
-                }
-            )
-            return (
-                {
-                    "stable_key": record.stable_key,
-                    "selected_index": selected_index,
-                    "outcome": "retryable",
-                    "reason": reason,
-                    "exclusion_reason": "transport_retryable",
-                    "attempt_count": 1,
-                    "source_ref": record.source_identity,
-                },
-                base_attempt,
-            )
-        if transport["status"] >= 400:
-            reason = f"fixture transport status {transport['status']}"
-            base_attempt.update(
-                {
-                    "outcome": "failed",
-                    "error": {"code": "transport_permanent", "message": reason},
-                }
-            )
-            return (
-                {
-                    "stable_key": record.stable_key,
-                    "selected_index": selected_index,
-                    "outcome": "failed",
-                    "reason": reason,
-                    "exclusion_reason": "transport_permanent",
-                    "attempt_count": 1,
-                    "source_ref": record.source_identity,
-                },
-                base_attempt,
-            )
+        return process_record(self, record, run_dir, selected_index)
 
-        try:
-            raw_bytes = self._fixture_bytes(record)
-        except (CatalogValidationError, OSError) as exc:
-            reason = str(exc)
-            base_attempt.update(
-                {
-                    "outcome": "rejected",
-                    "error": {"code": "fixture_read_error", "message": reason},
-                }
-            )
-            return (
-                {
-                    "stable_key": record.stable_key,
-                    "selected_index": selected_index,
-                    "outcome": "rejected",
-                    "reason": reason,
-                    "exclusion_reason": "fixture_read_error",
-                    "attempt_count": 1,
-                    "source_ref": record.source_identity,
-                },
-                base_attempt,
-            )
-        actual_hash = content_hash_bytes(raw_bytes)
-        expected_hash = str(record.transport["expected_raw_hash"])
-        if not expected_hash or actual_hash != expected_hash:
-            reason = (
-                f"raw hash mismatch: expected {expected_hash or '<missing>'} "
-                f"actual {actual_hash}"
-            )
-            base_attempt.update(
-                {
-                    "outcome": "rejected",
-                    "error": {
-                        "code": "raw_hash_mismatch",
-                        "message": reason,
-                        "expected": expected_hash,
-                        "actual": actual_hash,
-                    },
-                }
-            )
-            return (
-                {
-                    "stable_key": record.stable_key,
-                    "selected_index": selected_index,
-                    "outcome": "rejected",
-                    "reason": reason,
-                    "exclusion_reason": "raw_hash_mismatch",
-                    "attempt_count": 1,
-                    "raw_hash": actual_hash,
-                    "source_ref": record.source_identity,
-                },
-                base_attempt,
-            )
-        raw_path = run_dir / "raw" / f"{actual_hash}.bin"
-        _write_immutable(raw_path, raw_bytes, self.root)
-        base_attempt["raw_hash"] = actual_hash
-        base_attempt["validation_attempt"] = 1
-        try:
-            entry = parse_kbbi(raw_bytes, record.source_ref)
-            validate_entry(entry, raw_bytes=raw_bytes)
-            if (
-                normalize_stable_key(entry.id) != record.stable_key
-                and normalize_stable_key(entry.lema) != record.stable_key
-            ):
-                raise ValidationError("parsed entry identity does not match stable_key")
-        except QuarantinedError as exc:
-            reason = str(exc)
-            base_attempt.update(
-                {
-                    "outcome": "quarantined",
-                    "error": {
-                        "code": exc.reason,
-                        "message": reason,
-                    },
-                }
-            )
-            return (
-                {
-                    "stable_key": record.stable_key,
-                    "selected_index": selected_index,
-                    "outcome": "quarantined",
-                    "reason": reason,
-                    "exclusion_reason": getattr(exc, "reason", "quarantined"),
-                    "attempt_count": 1,
-                    "raw_hash": actual_hash,
-                    "raw_reference": _safe_relative(self.root, raw_path),
-                    "source_ref": record.source_identity,
-                },
-                base_attempt,
-            )
-        except (ParserError, ValidationError, ValueError, TypeError) as exc:
-            reason = str(exc)
-            base_attempt.update(
-                {
-                    "outcome": "rejected",
-                    "error": {
-                        "code": "deterministic_validation_failure",
-                        "message": reason,
-                    },
-                }
-            )
-            return (
-                {
-                    "stable_key": record.stable_key,
-                    "selected_index": selected_index,
-                    "outcome": "rejected",
-                    "reason": reason,
-                    "exclusion_reason": "deterministic_validation_failure",
-                    "attempt_count": 1,
-                    "raw_hash": actual_hash,
-                    "raw_reference": _safe_relative(self.root, raw_path),
-                    "source_ref": record.source_identity,
-                },
-                base_attempt,
-            )
-        canonical_payload = entry.model_dump(mode="json")
-        canonical_hash = canonical_json_hash(canonical_payload)
-        parsed_path = run_dir / "parsed" / f"{record.stable_key.replace(' ', '_')}.json"
-        _write_json(
-            parsed_path,
-            {
-                "schema_version": CHECKPOINT_SCHEMA_VERSION,
-                "stable_key": record.stable_key,
-                "entry": canonical_payload,
-                "canonical_content_hash": canonical_hash,
-                "candidate_namespace": False,
-            },
-            self.root,
-        )
-        base_attempt.update(
-            {
-                "outcome": "accepted",
-                "canonical_content_hash": canonical_hash,
-            }
-        )
-        return (
-            {
-                "stable_key": record.stable_key,
-                "selected_index": selected_index,
-                "outcome": "accepted",
-                "reason": "parsed_and_validated",
-                "attempt_count": 1,
-                "raw_hash": actual_hash,
-                "canonical_content_hash": canonical_hash,
-                "raw_reference": _safe_relative(self.root, raw_path),
-                "parsed_reference": _safe_relative(self.root, parsed_path),
-                "source_ref": record.source_identity,
-                "entry_id": entry.id,
-                "lema": entry.lema,
-                "candidate_namespace": False,
-            },
-            base_attempt,
-        )
-
-    def _fixture_bytes(self, record: _CatalogRecord) -> bytes:
-        transport = record.transport
+    def _fixture_bytes_for_transport(self, transport: Mapping[str, Any]) -> bytes:
         if "bytes" in transport:
             value = transport["bytes"]
             if isinstance(value, bytes):
@@ -499,6 +287,10 @@ class CheckpointExecutionMixin:
                 details={"path": path_value},
             ) from exc
         return path.read_bytes()
+
+    def _fixture_bytes(self, record: _CatalogRecord) -> bytes:
+        """Compatibility helper for callers that still pass a catalog record."""
+        return self._fixture_bytes_for_transport(record.transport)
 
     def _references(self, run_dir: Path, run_id: str) -> dict[str, str]:
         return {
@@ -627,7 +419,16 @@ class CheckpointExecutionMixin:
                 "emulator_attempts": 0,
                 "unapproved_host_attempts": 0,
                 "source_reads": sum(
-                    1 for attempt in attempts if int(attempt.get("status", 0)) < 400
+                    (
+                        sum(
+                            1
+                            for source_attempt in attempt.get("source_attempts", [])
+                            if int(source_attempt.get("status", 0)) < 400
+                        )
+                        if isinstance(attempt.get("source_attempts"), list)
+                        else int(attempt.get("status", 0)) < 400
+                    )
+                    for attempt in attempts
                 ),
                 "unselected_reads": 0,
                 "source_order": preflight.selected_keys,

@@ -14,14 +14,25 @@ bucket config); local write always succeeds. No Vertex/Firestore coupling.
 from __future__ import annotations
 
 import os
+import re
 from datetime import UTC
 from pathlib import Path
 from typing import Any
 
 from aksantara.domain.models import SourceRef
+from aksantara.domain.provenance import canonical_json_hash, content_hash_bytes
+from aksantara.ingest.checkpoint_storage import (
+    _canonical_bytes,
+    _read_json,
+    _safe_relative,
+    _write_immutable,
+)
 
 RAW_GCS_PREFIX: str = "raw"
 LOCAL_FIXTURE_DIR_NAME: str = "tests/replay/fixtures"
+RAW_SNAPSHOT_SCHEMA_VERSION = "raw-snapshot-v1"
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_OBSERVATION_ID_RE = re.compile(r"^observation-[0-9a-f]{32}$")
 
 
 def _project_root() -> Path:
@@ -59,6 +70,112 @@ def local_named_path(lema: str, base_dir: Path | None = None) -> Path:
     # sanitize slug to filename-safe
     safe: str = "".join(c if c.isalnum() or c in "-_" else "_" for c in slug)
     return base_dir / f"{safe}.html"
+
+
+class RawSnapshotStore:
+    """Caller-rooted immutable raw and observation store.
+
+    A raw snapshot is addressed only by the SHA-256 computed from its bytes.
+    Each retrieval/provenance observation gets a separate identity, so two
+    source references with equal bytes deduplicate the raw payload without
+    losing source URL, source kind, edition, version, or retrieval metadata.
+    """
+
+    def __init__(self, root: Path | str) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.raw_root = self.root / ".aksantara" / "raw-snapshots"
+        self.observation_root = self.root / ".aksantara" / "observations"
+
+    def put(
+        self,
+        raw_bytes: bytes,
+        source_ref: SourceRef,
+        *,
+        expected_raw_hash: str | None = None,
+        role: str = "source",
+    ) -> dict[str, Any]:
+        """Persist raw bytes and one immutable provenance observation."""
+        if not isinstance(raw_bytes, bytes) or not raw_bytes:
+            raise ValueError("raw_bytes must be non-empty bytes")
+        actual_hash = content_hash_bytes(raw_bytes)
+        expected = expected_raw_hash or source_ref.content_hash
+        if expected.lower() != actual_hash:
+            raise ValueError(
+                f"hash mismatch: expected {expected.lower()} actual {actual_hash}"
+            )
+        if source_ref.content_hash != actual_hash:
+            raise ValueError(
+                "source_ref content hash mismatch: "
+                f"expected {source_ref.content_hash} actual {actual_hash}"
+            )
+        raw_snapshot_id = f"raw-{actual_hash}"
+        source_payload = source_ref.model_dump(mode="json")
+        observation_preimage = {
+            "raw_snapshot_id": raw_snapshot_id,
+            "raw_sha256": actual_hash,
+            "source_ref": source_payload,
+            "role": role,
+        }
+        observation_id = f"observation-{canonical_json_hash(observation_preimage)[:32]}"
+        raw_path = self.raw_root / f"{actual_hash}.bin"
+        observation = {
+            "schema_version": RAW_SNAPSHOT_SCHEMA_VERSION,
+            "raw_snapshot_id": raw_snapshot_id,
+            "observation_id": observation_id,
+            "raw_sha256": actual_hash,
+            "raw_content_hash": actual_hash,
+            "role": role,
+            "source_ref": source_payload,
+            "retrieval": {
+                "url": source_ref.url,
+                "source_kind": source_ref.source_kind,
+                "edition": source_ref.edition,
+                "source_version": source_ref.source_version,
+                "retrieved_at": source_payload["retrieved_at"],
+            },
+            "raw_reference": _safe_relative(self.root, raw_path),
+            "immutable": True,
+        }
+        observation_path = self.observation_root / f"{observation_id}.json"
+        _write_immutable(raw_path, raw_bytes, self.root)
+        _write_immutable(observation_path, _canonical_bytes(observation), self.root)
+        return {
+            **observation,
+            "raw_path": str(raw_path),
+            "observation_path": str(observation_path),
+        }
+
+    record = put
+    save = put
+
+    def get(self, raw_snapshot_id: str) -> bytes:
+        """Load bytes by a ``raw-<sha256>`` identity and verify the hash."""
+        if raw_snapshot_id.startswith("raw-"):
+            digest = raw_snapshot_id[4:]
+        else:
+            digest = raw_snapshot_id
+        if not _HASH_RE.fullmatch(digest):
+            raise ValueError(f"invalid raw snapshot identity: {raw_snapshot_id!r}")
+        path = self.raw_root / f"{digest}.bin"
+        if not path.is_file():
+            raise FileNotFoundError(f"raw snapshot not found: {raw_snapshot_id}")
+        data = path.read_bytes()
+        actual = content_hash_bytes(data)
+        if actual != digest:
+            raise ValueError(
+                f"raw snapshot hash mismatch: expected {digest} actual {actual}"
+            )
+        return data
+
+    load = get
+
+    def get_observation(self, observation_id: str) -> dict[str, Any]:
+        if not _OBSERVATION_ID_RE.fullmatch(observation_id):
+            raise ValueError(f"invalid observation identity: {observation_id!r}")
+        path = self.observation_root / f"{observation_id}.json"
+        return _read_json(path)
+
+    read_observation = get_observation
 
 
 def save_raw(
@@ -99,6 +216,13 @@ def save_raw(
             or os.getenv("AKSANTARA_BUCKET")
         )
 
+    actual_hash = content_hash_bytes(raw_bytes)
+    if source_ref.content_hash != actual_hash:
+        raise ValueError(
+            "source_ref content hash mismatch: "
+            f"expected {source_ref.content_hash} actual {actual_hash}"
+        )
+
     # Local write — always
     base_dir: Path = (
         local_base_dir
@@ -107,13 +231,24 @@ def save_raw(
     )
     base_dir.mkdir(parents=True, exist_ok=True)
     hash_path: Path = base_dir / f"{source_ref.content_hash}.html"
-    hash_path.write_bytes(raw_bytes)
+    if hash_path.is_file():
+        if hash_path.read_bytes() != raw_bytes:
+            raise ValueError(
+                "immutable raw cache identity already contains different bytes"
+            )
+    else:
+        hash_path.write_bytes(raw_bytes)
 
     named_path_str: str = ""
     if also_save_named is not None:
         named_path: Path = local_named_path(also_save_named, base_dir=base_dir)
-        # Do not overwrite existing named fixture with different hash silently? Overwrite deterministically.
-        named_path.write_bytes(raw_bytes)
+        if named_path.is_file():
+            if named_path.read_bytes() != raw_bytes:
+                raise ValueError(
+                    "immutable named fixture identity already contains different bytes"
+                )
+        else:
+            named_path.write_bytes(raw_bytes)
         named_path_str = str(named_path)
 
     # GCS write — best effort

@@ -2,8 +2,9 @@
 
 The checkpoint driver is the bounded, local validation surface for the Phase 3
 corpus checkpoint. It does not perform live transport, use GCP or an emulator,
-write the canonical namespace, create a release candidate, or change a release
-pointer.
+write the canonical namespace, create vectors, or change a release pointer.
+It does persist immutable raw/provenance observations, review evidence, and a
+candidate only after the explicit fail-closed candidate gate succeeds.
 
 ## Public operations
 
@@ -26,6 +27,11 @@ The CLI operations are:
 | `attempts` | Reads the separate attempt history |
 | `checkpoint` | Reads the committed checkpoint revision and bounded cursor |
 | `execute` | Reads an existing run as an idempotent no-op |
+| `review-queue` | Reads open authority reviews in stable key/review ID order |
+| `review-read` | Reads one review record, including both immutable conflict sides |
+| `review-decision` | Appends `select_official`, `block`, or `reject` with idempotency |
+| `candidate-evaluate` | Evaluates exact official/raw/canonical/review/release joins |
+| `candidate-read` | Reads a previously persisted candidate evaluation |
 
 Use `--json` for one machine-readable JSON object. Invalid catalog or limit
 input exits nonzero before a run directory or fixture read is created. A
@@ -42,6 +48,11 @@ GET  /checkpoints/runs/{run_id}/report
 GET  /checkpoints/runs/{run_id}/outcomes
 GET  /checkpoints/runs/{run_id}/attempts
 GET  /checkpoints/runs/{run_id}/checkpoint
+GET  /checkpoints/reviews
+GET  /checkpoints/reviews/{review_id}
+POST /checkpoints/reviews/{review_id}/decisions
+POST /checkpoints/runs/{run_id}/candidate
+GET  /checkpoints/runs/{run_id}/candidate
 ```
 
 `POST /checkpoints/runs` is explicitly local-only and requires a caller-owned
@@ -97,8 +108,36 @@ declared hashes are checked, not trusted.
 
 The adapter accepts official KBBI hosts (`kbbi.kemdikbud.go.id`) and the
 labelled fallback host (`kbbi.web.id`) for evidence. The source kind must agree
-with its host. A fallback record remains evidence and is quarantined by the
-authority validator; the checkpoint driver never relabels it.
+with its host. Additional `observations` may bind official or lower-authority
+evidence, but a lower-authority observation cannot be labelled official. A
+fallback record remains evidence and is quarantined by the authority validator;
+the checkpoint driver never relabels it.
+
+## Authority review and candidate gate
+
+An official observation is ordered before every evidence observation. A
+successful official parse is the only canonical source. If official transport
+or validation fails, configured evidence may still be read after that attempt,
+but the item remains excluded. Lexical fields are compared in this order:
+`lema`, `sub_lema`, `ejaan`, `kelas_kata`, `makna`, `contoh`, `turunan`,
+`bentuk_baku`, `bentuk_tidak_baku`, `pelafalan`, `pemenggalan`, `etimologi`,
+`labels`, and `status`. Retrieval/provenance metadata differences do not create
+lexical conflicts.
+
+Conflicts are stored below `.aksantara/review/conflicts/` with both source
+references, raw/observation IDs, canonical hashes, differing fields, and
+field-level value hashes. Quarantines are stored below
+`.aksantara/review/quarantine/`. Review decisions append an event containing
+the reviewer, reason, timestamp, policy pin, and idempotency key. Selecting an
+official side resolves only the item conflict; release approval remains a
+separate explicit gate.
+
+`candidate-evaluate` returns `eligible=false` and an exclusion reason for every
+non-terminal, non-official, malformed, unresolved, or hash/pin-invalid item.
+It creates `.aksantara/candidates/<candidate-id>.json` only when the complete
+fixed 100-key checkpoint has exact raw/canonical/source joins, resolved item
+reviews, and explicit release approval with approver identity and reason. It
+never writes vectors, canonical entries, or the current-version pointer.
 
 ## Determinism and bounds
 
@@ -164,7 +203,7 @@ key. A retryable transport status is `blocked`; deterministic parser/schema/hash
 failures are terminal `rejected` or `quarantined`; permanent transport failures
 are `failed`.
 
-Accepted checkpoint rows are not a release candidate. Reports always state
-`candidate_created=false`, `pointer_changed=false`, and
-`release_operation=not_invoked`. Authority review, candidate eligibility,
-embedding, approval, and release promotion belong to later pipeline surfaces.
+The checkpoint report itself does not implicitly create a candidate and always
+states `pointer_changed=false` and `release_operation=not_invoked`. Candidate
+evaluation is a separate explicit operation; embedding, release promotion, and
+pointer changes remain outside this driver.

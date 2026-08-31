@@ -18,6 +18,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from aksantara.ingest.checkpoint_authority import CheckpointAuthorityMixin
+from aksantara.ingest.checkpoint_candidate import CheckpointCandidateMixin
 from aksantara.ingest.checkpoint_catalog import (
     _catalog_records,
     _validate_limit,
@@ -56,6 +58,8 @@ from aksantara.ingest.checkpoint_types import (
     RunResult,
 )
 from aksantara.parse.parser_contract import PARSER_VERSION
+from aksantara.validate.conflicts import LEXICAL_FIELDS
+from aksantara.validate.review import ReviewStore
 
 __all__ = [
     "CATALOG_SCHEMA_VERSION",
@@ -74,7 +78,11 @@ __all__ = [
 ]
 
 
-class CheckpointDriver(CheckpointExecutionMixin):
+class CheckpointDriver(
+    CheckpointExecutionMixin,
+    CheckpointAuthorityMixin,
+    CheckpointCandidateMixin,
+):
     """Run a bounded deterministic checkpoint using caller-owned fixtures."""
 
     _lock = threading.RLock()
@@ -145,6 +153,16 @@ class CheckpointDriver(CheckpointExecutionMixin):
             "fixture_manifest": {
                 "required_catalog_fields": ["catalog_id", "corpus_version", "entries"],
                 "required_entry_fields": ["stable_key", "source_ref", "transport"],
+                "optional_observation_fields": [
+                    "role",
+                    "source_ref",
+                    "transport",
+                ],
+                "observation_roles": {
+                    "official": "adapter-verified KBBI observation",
+                    "fallback": "labelled evidence only; never canonical",
+                    "evidence": "labelled non-authoritative evidence only",
+                },
                 "transport_adapter": "fixture",
                 "binding": "relative path under root or immutable inline bytes",
                 "required_hash": "expected_raw_hash equals source_ref.content_hash and actual bytes",
@@ -199,8 +217,38 @@ class CheckpointDriver(CheckpointExecutionMixin):
             },
             "promotion": {
                 "candidate_created": False,
+                "candidate_operation": "candidate-evaluate",
                 "pointer_changed": False,
-                "release_promotion": "never implicit; owned by a later release operation",
+                "release_promotion": "never implicit; no current pointer operation",
+            },
+            "authority_review": {
+                "lexical_fields": list(LEXICAL_FIELDS),
+                "metadata_only_fields": [
+                    "url",
+                    "retrieved_at",
+                    "edition",
+                    "source_version",
+                    "raw_sha256",
+                    "parser_version",
+                    "transform_version",
+                ],
+                "decisions": ["select_official", "block", "reject"],
+                "history": "append-only and idempotent by decision key",
+                "queue_order": "stable_key then review_id",
+            },
+            "candidate_gate": {
+                "operation": "candidate-evaluate",
+                "requires": [
+                    "terminal current outcomes",
+                    "adapter-verified official source",
+                    "raw/canonical exact joins",
+                    "resolved item review",
+                    "fixed 100-key complete checkpoint",
+                    "explicit release-level approval",
+                    "release approver identity and reason",
+                ],
+                "vectors_created": False,
+                "current_version_changed": False,
             },
             "network_trace": {
                 "local_mode": True,
@@ -217,6 +265,8 @@ class CheckpointDriver(CheckpointExecutionMixin):
                 "current outcomes",
                 "attempt history",
                 "idempotent execute/no-op",
+                "review queue/read/decision",
+                "candidate evaluation/read",
             ],
         }
 
@@ -382,6 +432,36 @@ class CheckpointDriver(CheckpointExecutionMixin):
     # describe the operation as start/create rather than run.
     start = run
     create = run
+
+    def review_queue(self) -> list[dict[str, Any]]:
+        """Read the deterministic open authority review queue."""
+        return ReviewStore(root=self.root).list_open()
+
+    def review_read(self, review_id: str) -> dict[str, Any]:
+        """Read one review record, including immutable source evidence."""
+        return ReviewStore(root=self.root).get(review_id)
+
+    def review_decide(
+        self,
+        review_id: str,
+        *,
+        decision: str,
+        reviewer: str,
+        reason: str,
+        policy_version: str,
+        idempotency_key: str | None = None,
+        timestamp: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an explicit append-only review decision."""
+        return ReviewStore(root=self.root).decide(
+            review_id,
+            decision=decision,
+            reviewer=reviewer,
+            reason=reason,
+            policy_version=policy_version,
+            idempotency_key=idempotency_key,
+            timestamp=timestamp,
+        )
 
     def _validate_idempotency_key(self, value: str) -> str:
         if not isinstance(value, str):

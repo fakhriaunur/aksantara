@@ -124,6 +124,7 @@ class _CatalogRecord:
     source_ref: SourceRef
     transport: dict[str, Any]
     ordinal: int
+    observations: tuple[dict[str, Any], ...] = ()
 
     @property
     def source_identity(self) -> dict[str, str]:
@@ -141,6 +142,13 @@ class _CatalogRecord:
         return {
             "stable_key": self.stable_key,
             "source_ref": self.source_identity,
+            "observations": [
+                {
+                    "role": str(observation.get("role", "evidence")),
+                    "source_ref": dict(observation["source_identity"]),
+                }
+                for observation in self.observations
+            ],
         }
 
     def public_dict(self) -> dict[str, Any]:
@@ -154,11 +162,21 @@ class _CatalogRecord:
             binding["path"] = self.transport["path"]
         else:
             binding["binding"] = "inline-immutable-bytes"
-        return {
+        result: dict[str, Any] = {
             "stable_key": self.stable_key,
             "source_ref": _source_ref_dict(self.source_ref),
             "transport": binding,
         }
+        if self.observations:
+            result["observations"] = [
+                {
+                    "role": observation.get("role", "evidence"),
+                    "source_ref": _source_ref_dict(observation["source_ref"]),
+                    "transport": dict(observation["transport_public"]),
+                }
+                for observation in self.observations
+            ]
+        return result
 
 
 @dataclass(frozen=True, slots=True)

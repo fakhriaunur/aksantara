@@ -15,17 +15,28 @@ from aksantara.domain.provenance import canonical_json_hash
 OFFICIAL_KINDS: frozenset[str] = frozenset({"official-live", "official-snapshot"})
 FALLBACK_KINDS: frozenset[str] = frozenset({"fallback", "gov-derived"})
 
-# Fields considered substantive for quarantine when official vs fallback diverge
-SUBSTANTIVE_FIELDS: tuple[str, ...] = (
+# Lexical fields are deliberately explicit and versioned.  Source URL,
+# retrieval time, raw hash, and parser metadata are provenance and must not
+# become lexical conflicts.
+LEXICAL_FIELDS: tuple[str, ...] = (
     "lema",
-    "makna",
+    "sub_lema",
+    "ejaan",
     "kelas_kata",
+    "makna",
     "contoh",
+    "turunan",
     "bentuk_baku",
     "bentuk_tidak_baku",
+    "pelafalan",
+    "pemenggalan",
     "etimologi",
+    "labels",
     "status",
 )
+
+# Backwards-compatible name used by the Phase 2 validator.
+SUBSTANTIVE_FIELDS = LEXICAL_FIELDS
 
 
 def _field_value(entry: KBBIEntry, field: str) -> Any:
@@ -57,6 +68,33 @@ def _values_equal(a: Any, b: Any) -> bool:
     return bool(a == b)
 
 
+def compare_lexical_fields(old: KBBIEntry, new: KBBIEntry) -> list[str]:
+    """Return differing lexical fields in the published stable order."""
+    return [
+        field
+        for field in LEXICAL_FIELDS
+        if not _values_equal(_field_value(old, field), _field_value(new, field))
+    ]
+
+
+def lexical_field_diffs(
+    official: KBBIEntry, fallback: KBBIEntry
+) -> list[dict[str, Any]]:
+    """Return field-level conflict evidence with deterministic value hashes."""
+    result: list[dict[str, Any]] = []
+    for field in compare_lexical_fields(official, fallback):
+        official_value = _field_value(official, field)
+        fallback_value = _field_value(fallback, field)
+        result.append(
+            {
+                "field": field,
+                "official_value_hash": canonical_json_hash(official_value),
+                "fallback_value_hash": canonical_json_hash(fallback_value),
+            }
+        )
+    return result
+
+
 def diff_versions(old: KBBIEntry, new: KBBIEntry) -> dict[str, tuple[Any, Any]]:
     """Return dict of field -> (old_value, new_value) where values differ.
 
@@ -73,7 +111,7 @@ def diff_versions(old: KBBIEntry, new: KBBIEntry) -> dict[str, tuple[Any, Any]]:
     """
     diffs: dict[str, tuple[Any, Any]] = {}
 
-    for field in SUBSTANTIVE_FIELDS:
+    for field in LEXICAL_FIELDS:
         ov: Any = _field_value(old, field)
         nv: Any = _field_value(new, field)
         if not _values_equal(ov, nv):
@@ -141,12 +179,15 @@ def has_substantive_conflict(old: KBBIEntry, new: KBBIEntry) -> bool:
 
 __all__ = [
     "FALLBACK_KINDS",
+    "LEXICAL_FIELDS",
     "OFFICIAL_KINDS",
     "SUBSTANTIVE_FIELDS",
+    "compare_lexical_fields",
     "detect_conflict",
     "detect_conflicts",
     "diff_versions",
     "has_substantive_conflict",
+    "lexical_field_diffs",
 ]
 
 # Back-compat alias (singular) for earlier tests

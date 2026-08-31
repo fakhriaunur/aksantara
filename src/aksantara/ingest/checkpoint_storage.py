@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -131,6 +132,10 @@ def _redact_catalog_request(catalog: Mapping[str, Any]) -> dict[str, Any]:
     def redact(value: Any, *, key: str | None = None) -> Any:
         if key in {"bytes", "raw_bytes", "content", "base64"}:
             return "<bound-immutable-bytes>"
+        if isinstance(value, (datetime, date)):
+            return value.isoformat().replace("+00:00", "Z")
+        if hasattr(value, "model_dump"):
+            return redact(value.model_dump(mode="json"), key=key)
         if isinstance(value, Mapping):
             return {
                 str(child_key): redact(child_value, key=str(child_key))
