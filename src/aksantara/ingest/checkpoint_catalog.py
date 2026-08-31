@@ -34,6 +34,64 @@ from aksantara.ingest.checkpoint_types import (
 )
 from aksantara.parse.parser_contract import PARSER_VERSION
 
+_MISSING = object()
+_INLINE_TRANSPORT_FIELDS = ("path", "raw_bytes", "bytes", "content", "base64")
+
+
+def _reject_unknown_fields(
+    payload: Mapping[str, Any],
+    *,
+    allowed: set[str],
+    context: str,
+    details: Mapping[str, Any] | None = None,
+) -> None:
+    """Reject fields that the catalog schema does not model.
+
+    Catalogs are identity-bearing input.  Ignoring a misspelled or legacy
+    reference field could make the caller believe an observation was
+    processed when it was not, so unknown fields fail before any fixture read.
+    """
+    unknown = sorted(
+        {
+            name if isinstance(name, str) else repr(name)
+            for name in payload
+            if not isinstance(name, str) or name not in allowed
+        }
+    )
+    if not unknown:
+        return
+    error_details: dict[str, Any] = {"fields": unknown}
+    if details:
+        error_details.update(details)
+    raise CatalogValidationError(
+        f"{context} contains unsupported fields",
+        details=error_details,
+    )
+
+
+def _aliased_value(
+    payload: Mapping[str, Any],
+    *names: str,
+    field: str,
+    required: bool = True,
+    default: object = _MISSING,
+) -> object:
+    """Read one schema field while rejecting ambiguous aliases."""
+    present = [name for name in names if name in payload]
+    if len(present) > 1:
+        raise CatalogValidationError(
+            f"{field} has ambiguous aliases",
+            details={"fields": present},
+        )
+    if present:
+        return payload[present[0]]
+    if not required:
+        return default
+    raise CatalogValidationError(
+        f"missing required field {field}",
+        details={"field": field},
+    )
+
 
 def _string_value(
     payload: Mapping[str, Any],
@@ -41,27 +99,28 @@ def _string_value(
     required: bool = True,
     default: str | None = None,
 ) -> str | None:
-    for name in names:
-        if name in payload:
-            value = payload[name]
-            if not isinstance(value, str):
-                raise CatalogValidationError(
-                    f"{name} must be a string",
-                    details={"field": name},
-                )
-            value = value.strip()
-            if value:
-                return value
-            if required:
-                raise CatalogValidationError(
-                    f"{name} must not be blank",
-                    details={"field": name},
-                )
-            return default
+    name = names[0]
+    value = _aliased_value(
+        payload,
+        *names,
+        field=name,
+        required=required,
+        default=default,
+    )
+    if value is _MISSING:
+        return default
+    if not isinstance(value, str):
+        raise CatalogValidationError(
+            f"{name} must be a string",
+            details={"field": name},
+        )
+    value = value.strip()
+    if value:
+        return value
     if required:
         raise CatalogValidationError(
-            f"missing required field {names[0]}",
-            details={"field": names[0]},
+            f"{name} must not be blank",
+            details={"field": name},
         )
     return default
 
@@ -182,6 +241,26 @@ def _parse_source_ref(payload: object, stable_key: str) -> SourceRef:
     if isinstance(payload, SourceRef):
         source_ref = payload
     elif isinstance(payload, Mapping):
+        _reject_unknown_fields(
+            payload,
+            allowed={
+                "url",
+                "source_url",
+                "source_kind",
+                "sourceKind",
+                "edition",
+                "source_version",
+                "sourceVersion",
+                "retrieved_at",
+                "retrievedAt",
+                "content_hash",
+                "contentHash",
+                "parser_version",
+                "parserVersion",
+            },
+            context="source_ref",
+            details={"stable_key": stable_key},
+        )
         url = _string_value(payload, "url", "source_url")
         source_kind = _string_value(payload, "source_kind", "sourceKind")
         edition = _string_value(
@@ -197,18 +276,22 @@ def _parse_source_ref(payload: object, stable_key: str) -> SourceRef:
             required=False,
             default="VI",
         )
-        retrieved_at_value: object = payload.get(
+        retrieved_at_value = _aliased_value(
+            payload,
             "retrieved_at",
-            payload.get("retrievedAt"),
+            "retrievedAt",
+            field="source_ref.retrieved_at",
         )
         if retrieved_at_value is None:
             raise CatalogValidationError(
                 "source_ref.retrieved_at is required",
                 details={"field": "source_ref.retrieved_at"},
             )
-        content_hash_value = payload.get(
+        content_hash_value = _aliased_value(
+            payload,
             "content_hash",
-            payload.get("contentHash"),
+            "contentHash",
+            field="source_ref.content_hash",
         )
         content_hash = _validate_hash(
             content_hash_value,
@@ -269,8 +352,17 @@ def _parse_source_ref(payload: object, stable_key: str) -> SourceRef:
                 "actual": source_ref.parser_version,
             },
         )
-    parsed_url = urlsplit(source_ref.url)
-    host = (parsed_url.hostname or "").lower()
+    try:
+        parsed_url = urlsplit(source_ref.url)
+        host = (parsed_url.hostname or "").lower()
+    except (UnicodeError, ValueError) as exc:
+        raise CatalogValidationError(
+            "source_ref.url is malformed",
+            details={
+                "field": "source_ref.url",
+                "error_type": type(exc).__name__,
+            },
+        ) from exc
     allowed_hosts = _OFFICIAL_HOSTS | _FALLBACK_HOSTS
     if parsed_url.scheme != "https" or host not in allowed_hosts:
         raise CatalogValidationError(
@@ -306,6 +398,28 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
             "transport must be an object",
             details={"stable_key": stable_key},
         )
+    _reject_unknown_fields(
+        payload,
+        allowed={
+            "adapter",
+            "adapter_name",
+            "status",
+            "content_type",
+            "contentType",
+            "comparison_mode",
+            "comparisonMode",
+            "expected_raw_hash",
+            "expectedRawHash",
+            "content_hash",
+            "path",
+            "bytes",
+            "raw_bytes",
+            "content",
+            "base64",
+        },
+        context="transport",
+        details={"stable_key": stable_key},
+    )
     adapter = _string_value(payload, "adapter", "adapter_name")
     if adapter not in _ALLOWED_FIXTURE_ADAPTERS:
         raise CatalogValidationError(
@@ -344,9 +458,14 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
             "transport.comparison_mode must be exact or sha256",
             details={"comparison_mode": comparison_mode},
         )
-    expected_raw_hash_value = payload.get(
+    expected_raw_hash_value = _aliased_value(
+        payload,
         "expected_raw_hash",
-        payload.get("expectedRawHash", payload.get("content_hash")),
+        "expectedRawHash",
+        "content_hash",
+        field="transport.expected_raw_hash",
+        required=False,
+        default=None,
     )
     if expected_raw_hash_value is None and status_value >= 400:
         expected_raw_hash = ""
@@ -362,11 +481,7 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
         # SourceRef is reconstructed above and available through caller later.
         pass
 
-    binding_names = [
-        name
-        for name in ("path", "bytes", "raw_bytes", "content", "base64")
-        if name in payload
-    ]
+    binding_names = [name for name in _INLINE_TRANSPORT_FIELDS if name in payload]
     # ``content`` is a deliberate immutable replacement for a path binding.
     # This lets a caller rerun a source under new bytes without mutating the
     # original fixture file; all other combinations remain ambiguous.
@@ -470,6 +585,27 @@ def _observation_dict(
             "observation must be an object",
             details={"stable_key": stable_key},
         )
+    _reject_unknown_fields(
+        payload,
+        allowed={
+            "role",
+            "observation_role",
+            "observationRole",
+            "source_ref",
+            "sourceRef",
+            "source",
+            "transport",
+            "fixture",
+            "snapshot",
+            "path",
+            "raw_bytes",
+            "bytes",
+            "content",
+            "base64",
+        },
+        context="observation",
+        details={"stable_key": stable_key},
+    )
     role = _string_value(
         payload,
         "role",
@@ -480,9 +616,12 @@ def _observation_dict(
     )
     if role is None:
         role = default_role
-    source_payload = payload.get(
+    source_payload = _aliased_value(
+        payload,
         "source_ref",
-        payload.get("sourceRef", payload.get("source")),
+        "sourceRef",
+        "source",
+        field="observation.source_ref",
     )
     source_ref = _parse_source_ref(source_payload, stable_key)
     if role not in {"official", "fallback", "evidence"}:
@@ -503,19 +642,28 @@ def _observation_dict(
         )
     if source_ref.source_kind in {"official-live", "official-snapshot"}:
         role = "official"
-    transport_payload = payload.get(
+    transport_payload = _aliased_value(
+        payload,
         "transport",
-        payload.get("fixture", payload.get("snapshot")),
+        "fixture",
+        "snapshot",
+        field="observation.transport",
+        required=False,
+        default=_MISSING,
     )
-    if transport_payload is None and any(
-        key in payload for key in ("raw_bytes", "bytes", "content", "base64", "path")
-    ):
+    binding_names = [key for key in _INLINE_TRANSPORT_FIELDS if key in payload]
+    if transport_payload is not _MISSING and binding_names:
+        raise CatalogValidationError(
+            "observation has ambiguous transport bindings",
+            details={"fields": [*binding_names, "transport"]},
+        )
+    if transport_payload is _MISSING and binding_names:
         transport_payload = {
-            key: payload[key]
-            for key in ("raw_bytes", "bytes", "content", "base64", "path")
-            if key in payload
+            key: payload[key] for key in _INLINE_TRANSPORT_FIELDS if key in payload
         }
         transport_payload["adapter"] = "fixture"
+    elif transport_payload is _MISSING:
+        transport_payload = None
     transport = _transport_dict(transport_payload, root, stable_key)
     expected = transport["expected_raw_hash"]
     if expected and expected != source_ref.content_hash:
@@ -554,25 +702,31 @@ def _additional_observations(
     root: Path,
     stable_key: str,
 ) -> tuple[dict[str, Any], ...]:
-    """Read optional paired observations and retain their caller bindings."""
-    raw_value: object = raw_record.get(
+    """Read the explicit observation array and retain caller bindings.
+
+    ``observations`` is the only additional-reference container in the
+    published schema.  Legacy plural/reference aliases are rejected instead
+    of being silently ignored or assigned an implicit processing order.
+    """
+    raw_value = _aliased_value(
+        raw_record,
         "observations",
-        raw_record.get("sources", raw_record.get("evidence")),
+        field="entry.observations",
+        required=False,
+        default=_MISSING,
     )
-    if raw_value is None:
-        # A compact manifest may use explicit official/fallback blocks.
-        compact: list[tuple[str, object]] = []
-        for name in ("official", "fallback"):
-            if name in raw_record:
-                compact.append((name, raw_record[name]))
-        raw_items: list[tuple[str, object]] = compact
+    if raw_value is _MISSING:
+        raw_items: list[tuple[str, object]] = []
     elif isinstance(raw_value, Mapping):
-        raw_items = [(str(key), value) for key, value in raw_value.items()]
+        raise CatalogValidationError(
+            "entry.observations must be an array",
+            details={"stable_key": stable_key},
+        )
     elif isinstance(raw_value, list):
         raw_items = [(str(index), value) for index, value in enumerate(raw_value)]
     else:
         raise CatalogValidationError(
-            "observations must be an array or object",
+            "entry.observations must be an array",
             details={"stable_key": stable_key},
         )
     observations: list[dict[str, Any]] = []
@@ -600,6 +754,17 @@ def _additional_observations(
             "observations contain duplicate source references",
             details={"stable_key": stable_key},
         )
+    observations.sort(
+        key=lambda observation: (
+            str(observation.get("role", "evidence")),
+            str(observation["source_identity"]["url"]),
+            str(observation["source_identity"]["source_kind"]),
+            str(observation["source_identity"]["edition"]),
+            str(observation["source_identity"]["source_version"]),
+            str(observation["source_identity"]["content_hash"]),
+            str(observation["source_identity"]["parser_version"]),
+        )
+    )
     return tuple(observations)
 
 

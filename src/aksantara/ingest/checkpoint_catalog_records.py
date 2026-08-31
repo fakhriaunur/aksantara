@@ -7,8 +7,12 @@ from pathlib import Path
 from typing import Any
 
 from aksantara.ingest.checkpoint_catalog import (
+    _INLINE_TRANSPORT_FIELDS,
+    _MISSING,
     _additional_observations,
+    _aliased_value,
     _parse_source_ref,
+    _reject_unknown_fields,
     _string_value,
     _transport_dict,
     normalize_stable_key,
@@ -29,6 +33,25 @@ def catalog_records(
     *,
     root: Path,
 ) -> tuple[str, str, tuple[_CatalogRecord, ...], dict[str, Any]]:
+    _reject_unknown_fields(
+        catalog,
+        allowed={
+            "catalog_id",
+            "catalogId",
+            "id",
+            "corpus_version",
+            "corpusVersion",
+            "entries",
+            "records",
+            "items",
+            "pins",
+            "authority_mode",
+            "authorityMode",
+            "comparison_mode",
+            "comparisonMode",
+        },
+        context="catalog",
+    )
     catalog_id = _string_value(catalog, "catalog_id", "catalogId", "id")
     corpus_version = _string_value(
         catalog,
@@ -39,7 +62,13 @@ def catalog_records(
         raise CatalogValidationError("catalog identity is incomplete")
     if _CONTROL_RE.search(catalog_id) or _CONTROL_RE.search(corpus_version):
         raise CatalogValidationError("catalog identity contains a control character")
-    entries_value = catalog.get("entries", catalog.get("records", catalog.get("items")))
+    entries_value = _aliased_value(
+        catalog,
+        "entries",
+        "records",
+        "items",
+        field="catalog.entries",
+    )
     if not isinstance(entries_value, list):
         raise CatalogValidationError(
             "catalog.entries must be an array",
@@ -50,6 +79,18 @@ def catalog_records(
         pins_value = {}
     if not isinstance(pins_value, Mapping):
         raise CatalogValidationError("catalog.pins must be an object")
+    _reject_unknown_fields(
+        pins_value,
+        allowed={
+            "parser_version",
+            "parserVersion",
+            "transform_version",
+            "transformVersion",
+            "validation_policy",
+            "validationPolicy",
+        },
+        context="catalog.pins",
+    )
     parser_pin = _string_value(
         pins_value,
         "parser_version",
@@ -94,6 +135,32 @@ def catalog_records(
                 "catalog entry must be an object",
                 details={"ordinal": ordinal},
             )
+        # Entry identity is a public schema boundary.  In particular, do not
+        # accept a misspelled/plural reference container that the execution
+        # layer would not process.
+        _reject_unknown_fields(
+            raw_record,
+            allowed={
+                "stable_key",
+                "stableKey",
+                "key",
+                "id",
+                "lema",
+                "source_ref",
+                "sourceRef",
+                "source",
+                "transport",
+                "fixture",
+                "snapshot",
+                "raw_bytes",
+                "bytes",
+                "content",
+                "base64",
+                "observations",
+            },
+            context="catalog entry",
+            details={"ordinal": ordinal},
+        )
         raw_key = _string_value(
             raw_record,
             "stable_key",
@@ -115,24 +182,38 @@ def catalog_records(
                 },
             )
         seen[stable_key] = ordinal
-        source_payload = raw_record.get(
+        source_payload = _aliased_value(
+            raw_record,
             "source_ref",
-            raw_record.get("sourceRef", raw_record.get("source")),
+            "sourceRef",
+            "source",
+            field="entry.source_ref",
         )
         source_ref = _parse_source_ref(source_payload, stable_key)
-        transport_payload = raw_record.get(
+        transport_payload = _aliased_value(
+            raw_record,
             "transport",
-            raw_record.get("fixture", raw_record.get("snapshot")),
+            "fixture",
+            "snapshot",
+            field="entry.transport",
+            required=False,
+            default=_MISSING,
         )
-        if transport_payload is None and any(
-            key in raw_record for key in ("raw_bytes", "bytes", "content", "base64")
-        ):
+        binding_names = [key for key in _INLINE_TRANSPORT_FIELDS if key in raw_record]
+        if transport_payload is not _MISSING and binding_names:
+            raise CatalogValidationError(
+                "entry has ambiguous transport bindings",
+                details={"fields": [*binding_names, "transport"]},
+            )
+        if transport_payload is _MISSING and binding_names:
             transport_payload = {
                 key: raw_record[key]
-                for key in ("raw_bytes", "bytes", "content", "base64")
+                for key in _INLINE_TRANSPORT_FIELDS
                 if key in raw_record
             }
             transport_payload["adapter"] = "fixture"
+        elif transport_payload is _MISSING:
+            transport_payload = None
         transport = _transport_dict(transport_payload, root, stable_key)
         expected = transport["expected_raw_hash"]
         if expected and expected != source_ref.content_hash:
@@ -144,17 +225,38 @@ def catalog_records(
                     "expected_raw_hash": expected,
                 },
             )
+        observations = _additional_observations(
+            raw_record,
+            root=root,
+            stable_key=stable_key,
+        )
+        source_identities = [
+            (
+                source_ref.source_kind,
+                source_ref.content_hash,
+                source_ref.url,
+            ),
+            *[
+                (
+                    observation["source_ref"].source_kind,
+                    observation["source_ref"].content_hash,
+                    observation["source_ref"].url,
+                )
+                for observation in observations
+            ],
+        ]
+        if len(source_identities) != len(set(source_identities)):
+            raise CatalogValidationError(
+                "catalog entry contains duplicate source references",
+                details={"stable_key": stable_key},
+            )
         records.append(
             _CatalogRecord(
                 stable_key=stable_key,
                 source_ref=source_ref,
                 transport=transport,
                 ordinal=ordinal,
-                observations=_additional_observations(
-                    raw_record,
-                    root=root,
-                    stable_key=stable_key,
-                ),
+                observations=observations,
             )
         )
     policy_inputs = {

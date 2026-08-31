@@ -152,12 +152,94 @@ class CheckpointDriver(
             },
             "fixture_manifest": {
                 "required_catalog_fields": ["catalog_id", "corpus_version", "entries"],
+                "catalog_fields": [
+                    "catalog_id",
+                    "corpus_version",
+                    "entries",
+                    "pins",
+                    "authority_mode",
+                    "comparison_mode",
+                ],
                 "required_entry_fields": ["stable_key", "source_ref", "transport"],
-                "optional_observation_fields": [
-                    "role",
+                "entry_fields": [
+                    "stable_key",
                     "source_ref",
                     "transport",
+                    "observations",
                 ],
+                "entry_observation_schema": {
+                    "container": "observations",
+                    "type": "array",
+                    "required_item_fields": ["source_ref", "transport"],
+                    "optional_item_fields": ["role"],
+                    "additional_fields": "reject before fixture reads",
+                    "unsupported_container_aliases": [
+                        "sources",
+                        "evidence",
+                        "source_refs",
+                        "sourceReferences",
+                        "references",
+                        "additional_observations",
+                        "official",
+                        "fallback",
+                    ],
+                    "ordering": (
+                        "sort by role, then source-reference identity "
+                        "(url, source_kind, edition, source_version, "
+                        "content_hash, parser_version)"
+                    ),
+                    "processing": (
+                        "the primary source_ref/transport is retained as the "
+                        "record's first binding; every observations item is "
+                        "validated, fingerprinted, and processed as an "
+                        "additional evidence binding"
+                    ),
+                },
+                "accepted_field_aliases": {
+                    "catalog_id": ["catalogId", "id"],
+                    "corpus_version": ["corpusVersion"],
+                    "entries": ["records", "items"],
+                    "authority_mode": ["authorityMode"],
+                    "comparison_mode": ["comparisonMode"],
+                    "pins": {
+                        "parser_version": ["parserVersion"],
+                        "transform_version": ["transformVersion"],
+                        "validation_policy": ["validationPolicy"],
+                    },
+                    "entry": {
+                        "stable_key": ["stableKey", "key", "id", "lema"],
+                        "source_ref": ["sourceRef", "source"],
+                        "transport": ["fixture", "snapshot"],
+                    },
+                    "source_ref": {
+                        "url": ["source_url"],
+                        "source_kind": ["sourceKind"],
+                        "source_version": ["sourceVersion"],
+                        "retrieved_at": ["retrievedAt"],
+                        "content_hash": ["contentHash"],
+                        "parser_version": ["parserVersion"],
+                    },
+                    "transport": {
+                        "adapter": ["adapter_name"],
+                        "content_type": ["contentType"],
+                        "comparison_mode": ["comparisonMode"],
+                        "expected_raw_hash": [
+                            "expectedRawHash",
+                            "content_hash",
+                        ],
+                        "bytes": ["raw_bytes"],
+                    },
+                    "observation": {
+                        "role": ["observation_role", "observationRole"],
+                        "source_ref": ["sourceRef", "source"],
+                        "transport": ["fixture", "snapshot"],
+                    },
+                },
+                "alias_policy": (
+                    "at most one spelling of each field may be present; "
+                    "coexisting aliases are ambiguous and rejected"
+                ),
+                "additional_fields": "reject before fixture reads",
                 "observation_roles": {
                     "official": "adapter-verified KBBI observation",
                     "fallback": "labelled evidence only; never canonical",

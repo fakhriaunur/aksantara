@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -181,6 +183,258 @@ def test_invalid_source_identity_is_a_catalog_error(tmp_path: Path) -> None:
             {**manifest, "entries": [entry]},
             limit=1,  # type: ignore[arg-type]
         )
+
+
+def test_malformed_bracketed_source_url_is_structured_preflight_error(
+    tmp_path: Path,
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    source_ref = dict(entry["source_ref"])  # type: ignore[index]
+    source_ref["url"] = "https://[malformed/entri/entry-000"
+    entry["source_ref"] = source_ref
+
+    with pytest.raises(CatalogValidationError) as caught:
+        CheckpointDriver(root=tmp_path).run(
+            {**manifest, "entries": [entry]},
+            limit=1,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.code == "invalid_catalog"
+    assert "url" in caught.value.message
+    assert not (tmp_path / ".aksantara").exists()
+
+
+@pytest.mark.parametrize(
+    "unmodeled_field",
+    [
+        "sources",
+        "evidence",
+        "source_refs",
+        "sourceReferences",
+        "references",
+        "additional_observations",
+    ],
+)
+def test_unmodeled_additional_reference_fields_fail_before_processing(
+    tmp_path: Path,
+    unmodeled_field: str,
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    entry[unmodeled_field] = []
+
+    with pytest.raises(CatalogValidationError) as caught:
+        CheckpointDriver(root=tmp_path).run(
+            {**manifest, "entries": [entry]},
+            limit=1,  # type: ignore[arg-type]
+        )
+
+    assert caught.value.code == "invalid_catalog"
+    assert unmodeled_field in str(caught.value.details)
+    assert not (tmp_path / ".aksantara").exists()
+
+
+def test_ambiguous_reference_aliases_fail_before_processing(tmp_path: Path) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    entry["observations"] = []
+    entry["sources"] = []
+
+    with pytest.raises(CatalogValidationError):
+        CheckpointDriver(root=tmp_path).preflight(
+            {**manifest, "entries": [entry]},
+            limit=1,  # type: ignore[arg-type]
+        )
+
+    assert not (tmp_path / ".aksantara").exists()
+
+
+def test_api_malformed_source_url_returns_structured_catalog_error(
+    tmp_path: Path,
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    source_ref = dict(entry["source_ref"])  # type: ignore[index]
+    source_ref["url"] = "https://[malformed/entri/entry-000"
+    entry["source_ref"] = source_ref
+
+    response = TestClient(create_app()).post(
+        "/checkpoints/runs",
+        json={
+            "root": str(tmp_path),
+            "catalog": {**manifest, "entries": [entry]},
+            "limit": 1,
+            "idempotency_key": "malformed-url",
+        },
+    )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["detail"]["code"] == "invalid_catalog"
+    assert "traceback" not in response.text.lower()
+    assert not (tmp_path / ".aksantara").exists()
+
+
+def test_cli_malformed_source_url_returns_machine_readable_error(
+    tmp_path: Path,
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    source_ref = dict(entry["source_ref"])  # type: ignore[index]
+    source_ref["url"] = "https://[malformed/entri/entry-000"
+    entry["source_ref"] = source_ref
+    catalog_path = tmp_path / "catalog.json"
+    catalog_path.write_text(
+        json.dumps({**manifest, "entries": [entry]}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).parents[2] / "scripts" / "checkpoint.py"),
+            "run",
+            "--root",
+            str(tmp_path),
+            "--catalog",
+            str(catalog_path),
+            "--limit",
+            "1",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    body = json.loads(result.stdout)
+    assert body["error"]["code"] == "invalid_catalog"
+    assert "traceback" not in result.stdout.lower()
+    assert not (tmp_path / ".aksantara" / "checkpoint-runs").exists()
+
+
+def test_contract_publishes_explicit_observation_schema() -> None:
+    contract = CheckpointDriver.contract()
+    schema = contract["fixture_manifest"]["entry_observation_schema"]
+
+    assert schema["container"] == "observations"
+    assert schema["type"] == "array"
+    assert "source_ref" in schema["required_item_fields"]
+    assert "transport" in schema["required_item_fields"]
+    assert "sources" in schema["unsupported_container_aliases"]
+    assert schema["additional_fields"] == "reject before fixture reads"
+
+
+@pytest.mark.parametrize(
+    ("location", "aliases"),
+    [
+        ("entry", ("source_ref", "source")),
+        ("source_ref", ("retrieved_at", "retrievedAt")),
+        ("transport", ("expected_raw_hash", "expectedRawHash")),
+        ("observation", ("transport", "fixture")),
+    ],
+)
+def test_ambiguous_supported_aliases_fail_closed(
+    tmp_path: Path,
+    location: str,
+    aliases: tuple[str, str],
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    if location == "entry":
+        entry[aliases[1]] = entry[aliases[0]]
+    elif location == "source_ref":
+        source_ref = dict(entry["source_ref"])  # type: ignore[index]
+        source_ref[aliases[1]] = source_ref[aliases[0]]
+        entry["source_ref"] = source_ref
+    elif location == "transport":
+        transport = dict(entry["transport"])  # type: ignore[index]
+        transport[aliases[1]] = transport[aliases[0]]
+        entry["transport"] = transport
+    else:
+        entry["observations"] = [
+            {
+                "source_ref": entry["source_ref"],
+                aliases[0]: entry["transport"],
+                aliases[1]: entry["transport"],
+            }
+        ]
+
+    with pytest.raises(CatalogValidationError):
+        CheckpointDriver(root=tmp_path).preflight(
+            {**manifest, "entries": [entry]},
+            limit=1,  # type: ignore[arg-type]
+        )
+
+    assert not (tmp_path / ".aksantara").exists()
+
+
+def test_mixed_transport_wrapper_and_inline_binding_is_rejected(
+    tmp_path: Path,
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    entry["content"] = "<entry><h1>entry-000</h1></entry>"
+
+    with pytest.raises(CatalogValidationError):
+        CheckpointDriver(root=tmp_path).preflight(
+            {**manifest, "entries": [entry]},
+            limit=1,  # type: ignore[arg-type]
+        )
+
+    assert not (tmp_path / ".aksantara").exists()
+
+
+def test_supported_observations_are_explicit_and_order_invariant(
+    tmp_path: Path,
+) -> None:
+    manifest = _catalog(tmp_path, count=1)
+    entry = dict(manifest["entries"][0])  # type: ignore[index]
+    raw = Path(tmp_path / "fixtures" / "entry-000.html").read_bytes()
+    raw_hash = content_hash_bytes(raw)
+    observation = {
+        "role": "fallback",
+        "source_ref": {
+            "url": "https://kbbi.web.id/entri/entry-000",
+            "source_kind": "fallback",
+            "edition": "VI",
+            "source_version": "fixture-v1",
+            "retrieved_at": "2026-08-31T00:00:00Z",
+            "content_hash": raw_hash,
+            "parser_version": "0.1.0",
+        },
+        "transport": {
+            "adapter": "fixture",
+            "content": raw.decode(),
+            "content_type": "text/html",
+            "expected_raw_hash": raw_hash,
+            "comparison_mode": "exact",
+            "status": 200,
+        },
+    }
+    second_observation = {
+        **observation,
+        "source_ref": {
+            **observation["source_ref"],  # type: ignore[index]
+            "url": "https://kbbi.web.id/entri/entry-000?mirror=2",
+        },
+    }
+    entry["observations"] = [observation, second_observation]
+    ordered = {**manifest, "entries": [entry]}
+    reversed_observations = {
+        **manifest,
+        "entries": [{**entry, "observations": [second_observation, observation]}],
+    }
+
+    driver = CheckpointDriver(root=tmp_path)
+    left = driver.preflight(ordered, limit=1)
+    right = driver.preflight(reversed_observations, limit=1)
+
+    assert left.catalog_fingerprint == right.catalog_fingerprint
+    assert left.run_fingerprint == right.run_fingerprint
+    assert left.to_dict()["records"][0]["observations"][0]["role"] == "fallback"
 
 
 def test_equivalent_input_order_has_same_release_fingerprint(tmp_path: Path) -> None:

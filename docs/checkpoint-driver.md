@@ -102,6 +102,12 @@ The catalog is caller-owned JSON. Its identity and every entry are required:
 }
 ```
 
+The catalog and entry objects reject unknown fields during preflight. The
+documented snake-case fields above are canonical; the contract endpoint lists
+the small set of accepted compatibility aliases (`catalogId`,
+`corpusVersion`, `stableKey`, `sourceRef`, and so on). Aliases are accepted
+only one at a time, never merged by precedence.
+
 `transport.path` is relative to the caller root and must resolve to an
 existing file below that root. Inline callers may instead use immutable
 `content`, `base64`, or Python-only `bytes`. A successful fixture must bind
@@ -109,6 +115,19 @@ exactly one representation, except that an inline `content` value may
 explicitly replace a path binding for a changed-source lineage test. The
 adapter computes SHA-256 from actual bytes; declared hashes are checked, not
 trusted.
+
+Each entry has one primary `source_ref`/`transport` pair. Additional source
+references, when intentionally supplied, must be represented by the
+`observations` array. Each item contains `source_ref`, `transport`, and an
+optional `role` (`official`, `fallback`, or `evidence`). Items are sorted by
+role and the complete source-reference identity before fingerprinting and
+processing, so input array order is not meaningful. Unsupported containers or
+aliases such as `sources`, `evidence`, `source_refs`, `sourceReferences`,
+`references`, `additional_observations`, `official`, and `fallback` are
+rejected during preflight, as are unknown observation fields. An ambiguous
+pair of aliases for any source, transport, role, or identity field is also
+rejected. This fail-closed rule prevents a reference from being accepted in
+the manifest and silently omitted from source processing.
 
 The adapter accepts official KBBI hosts (`kbbi.kemdikbud.go.id`) and the
 labelled fallback host (`kbbi.web.id`) for evidence. The source kind must agree
