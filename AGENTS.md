@@ -15,7 +15,12 @@ Aksantara is a KBBI-first Indonesian language-data fuel layer. KBBI is the sole 
 
 ## File editing
 
-Do not use the ApplyPatch tool. Use edit, multiedit, create, or bounded Python/shell scripts for file changes.
+Use this file-editing priority:
+1. ApplyPatch.
+2. Edit, MultiEdit, or Create if ApplyPatch fails or cannot safely express the change.
+3. Bounded Python/shell scripts only as a final fallback.
+
+Review each change and preserve user work.
 
 ## Tooling contract
 
