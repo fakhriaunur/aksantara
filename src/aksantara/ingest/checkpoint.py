@@ -184,15 +184,18 @@ class CheckpointDriver(
                         "fallback",
                     ],
                     "ordering": (
-                        "sort by role, then source-reference identity "
+                        "adapter-verified official bindings first, with the "
+                        "primary binding first within its authority tier; "
+                        "then sort by role and source-reference identity "
                         "(url, source_kind, edition, source_version, "
                         "content_hash, parser_version)"
                     ),
                     "processing": (
-                        "the primary source_ref/transport is retained as the "
-                        "record's first binding; every observations item is "
-                        "validated, fingerprinted, and processed as an "
-                        "additional evidence binding"
+                        "attempt every official binding in deterministic "
+                        "order, select the first successful adapter-verified "
+                        "official observation, then process lower-authority "
+                        "bindings as labelled evidence; every binding emits "
+                        "one physical attempt record"
                     ),
                 },
                 "accepted_field_aliases": {
@@ -244,6 +247,46 @@ class CheckpointDriver(
                     "official": "adapter-verified KBBI observation",
                     "fallback": "labelled evidence only; never canonical",
                     "evidence": "labelled non-authoritative evidence only",
+                },
+                "authority_selection": {
+                    "official_kinds": [
+                        "official-live",
+                        "official-snapshot",
+                    ],
+                    "selection": (
+                        "first successful official observation after transport, "
+                        "raw-hash, parse, schema, provenance, and identity checks"
+                    ),
+                    "fallback_gate": (
+                        "lower-authority evidence is considered only after all "
+                        "preceding configured official bindings have been attempted"
+                    ),
+                    "successful_official_backup": (
+                        "a backup official observation may be selected when an "
+                        "earlier official binding is retryable or otherwise fails"
+                    ),
+                },
+                "attempt_record": {
+                    "one_per_physical_observation": True,
+                    "ordered_by": "run_id, selected_index, sequence",
+                    "required_fields": [
+                        "attempt_id",
+                        "run_id",
+                        "stable_key",
+                        "sequence",
+                        "source_ref",
+                        "source_kind",
+                        "source_role",
+                        "outcome",
+                        "raw_hash",
+                        "raw_snapshot_id",
+                        "observation_id",
+                        "canonical_content_hash",
+                        "parse_result",
+                        "validation_result",
+                        "conflict_result",
+                    ],
+                    "logical_key_rows_are_separate": True,
                 },
                 "transport_adapter": "fixture",
                 "binding": "relative path under root or immutable inline bytes",
@@ -321,6 +364,27 @@ class CheckpointDriver(
                 "decisions": ["select_official", "block", "reject"],
                 "history": "append-only and idempotent by decision key",
                 "queue_order": "stable_key then review_id",
+            },
+            "attempt_history": {
+                "logical_key_record": "one current outcome per selected stable_key",
+                "physical_record": "one record per configured source observation",
+                "report_fields": [
+                    "logical_attempt_count",
+                    "physical_attempt_count",
+                    "physical_attempts",
+                ],
+                "run_linkage": ["run_id", "selected_index", "sequence"],
+                "lineage_fields": [
+                    "source_ref",
+                    "source_role",
+                    "raw_hash",
+                    "raw_snapshot_id",
+                    "observation_id",
+                    "canonical_content_hash",
+                    "parse_result",
+                    "validation_result",
+                    "conflict_result",
+                ],
             },
             "candidate_gate": {
                 "operation": "candidate-evaluate",
@@ -500,10 +564,16 @@ class CheckpointDriver(
     def attempts(self, run_id: str) -> dict[str, Any]:
         run_dir = self._existing_run_dir(run_id)
         payload = _read_json(run_dir / "attempts.json")
+        physical_attempts = payload.get("physical_attempts")
+        if not isinstance(physical_attempts, list):
+            physical_attempts = []
         return {
             "run_id": run_id,
             "revision": payload.get("revision"),
             "attempt_count": payload.get("attempt_count"),
+            "physical_attempt_count": payload.get(
+                "physical_attempt_count", len(physical_attempts)
+            ),
             "logical_attempt_count": payload.get(
                 "logical_attempt_count", payload.get("attempt_count")
             ),
@@ -511,6 +581,7 @@ class CheckpointDriver(
                 "transport_attempt_count", payload.get("attempt_count")
             ),
             "attempts": payload.get("attempts", []),
+            "physical_attempts": physical_attempts,
         }
 
     def history(self) -> dict[str, Any]:

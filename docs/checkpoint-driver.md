@@ -119,9 +119,11 @@ trusted.
 Each entry has one primary `source_ref`/`transport` pair. Additional source
 references, when intentionally supplied, must be represented by the
 `observations` array. Each item contains `source_ref`, `transport`, and an
-optional `role` (`official`, `fallback`, or `evidence`). Items are sorted by
-role and the complete source-reference identity before fingerprinting and
-processing, so input array order is not meaningful. Unsupported containers or
+optional `role` (`official`, `fallback`, or `evidence`). Official bindings are
+attempted before lower-authority bindings; the primary binding is first within
+its authority tier, and remaining bindings are sorted by role and complete
+source-reference identity before fingerprinting and processing, so input array
+order is not meaningful. Unsupported containers or
 aliases such as `sources`, `evidence`, `source_refs`, `sourceReferences`,
 `references`, `additional_observations`, `official`, and `fallback` are
 rejected during preflight, as are unknown observation fields. An ambiguous
@@ -138,10 +140,14 @@ the checkpoint driver never relabels it.
 
 ## Authority review and candidate gate
 
-An official observation is ordered before every evidence observation. A
-successful official parse is the only canonical source. If official transport
-or validation fails, configured evidence may still be read after that attempt,
-but the item remains excluded. Lexical fields are compared in this order:
+All configured official bindings are attempted in deterministic order. The first
+successful adapter-verified official observation after transport, raw-hash,
+parse, schema, provenance, and identity checks is selected as the canonical
+source. A successful backup official observation can therefore be selected
+after an earlier retryable or failed official observation. Lower-authority
+evidence is considered only after the official tier has been attempted; it is
+always labelled evidence and never selected as canonical. Lexical fields are
+compared in this order:
 `lema`, `sub_lema`, `ejaan`, `kelas_kata`, `makna`, `contoh`, `turunan`,
 `bentuk_baku`, `bentuk_tidak_baku`, `pelafalan`, `pemenggalan`, `etimologi`,
 `labels`, and `status`. Retrieval/provenance metadata differences do not create
@@ -158,9 +164,10 @@ separate explicit gate.
 `candidate-evaluate` returns `eligible=false` and an exclusion reason for every
 non-terminal, non-official, malformed, unresolved, or hash/pin-invalid item.
 It creates `.aksantara/candidates/<candidate-id>.json` only when the complete
-fixed 100-key checkpoint has exact raw/canonical/source joins, resolved item
-reviews, and explicit release approval with approver identity and reason. It
-never writes vectors, canonical entries, or the current-version pointer.
+fixed 100-key checkpoint has exact raw/canonical/source/observation joins,
+matching authority roles and parser pins, resolved item reviews, and explicit
+release approval with approver identity and reason. It never writes vectors,
+canonical entries, or the current-version pointer.
 
 ## Determinism and bounds
 
@@ -211,6 +218,18 @@ current snapshot; outcome, attempt, checkpoint, report, and request identities
 remain readable in the caller root. An identical idempotency key and run tuple
 returns the existing run without source reads or duplicate artifacts. Reusing
 the key with a changed tuple returns a conflict before source processing.
+
+`attempts.json` has two explicit ledgers. `attempts` contains one logical
+attempt row for each selected stable key for compatibility with earlier
+checkpoint consumers. `physical_attempts` contains exactly one ordered row for
+each configured source observation, including retryable/permanent transport
+failures, hash/parse/validation failures, successful backup official
+observations, lower-authority evidence, and conflict sides. Each physical row
+includes `attempt_id`, `run_id`, `stable_key`, `sequence`, `source_ref`,
+`source_kind`, `source_role`, `outcome`, raw/observation IDs and hashes,
+`canonical_content_hash`, parse/validation results, and `conflict_result`.
+Reports expose `physical_attempt_count` and `physical_attempts` separately
+from `logical_attempt_count`, current outcomes, and outcome counts.
 
 Each report conserves:
 

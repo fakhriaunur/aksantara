@@ -111,6 +111,7 @@ class CheckpointCandidateMixin:
                 item_reviews,
                 run_dir=run_dir,
                 run_fingerprint=run_fingerprint,
+                pins=report.get("pins"),
             )
             if item_eligible and candidate_item is not None:
                 eligible_items.append(candidate_item)
@@ -240,6 +241,7 @@ class CheckpointCandidateMixin:
         *,
         run_dir: Path,
         run_fingerprint: str,
+        pins: Mapping[str, Any] | None = None,
     ) -> tuple[bool, str | None, dict[str, Any] | None]:
         """Validate one outcome and materialize its exact candidate join."""
         outcome = str(item.get("outcome", ""))
@@ -274,6 +276,21 @@ class CheckpointCandidateMixin:
         source_kind = str(source_ref.get("source_kind", ""))
         if source_kind not in {"official-live", "official-snapshot"}:
             return False, "official_required", None
+        if (
+            str(item.get("source_role", "")) != "official"
+            or str(item.get("authority_role", "")) != "official"
+        ):
+            return False, "official_role_mismatch", None
+        expected_parser_pin = (
+            str(pins.get("parser_version"))
+            if isinstance(pins, Mapping) and pins.get("parser_version")
+            else None
+        )
+        if (
+            expected_parser_pin is not None
+            and str(source_ref.get("parser_version", "")) != expected_parser_pin
+        ):
+            return False, "parser_pin_mismatch", None
 
         parsed_reference = item.get("parsed_reference")
         if not isinstance(parsed_reference, str) or not parsed_reference:
@@ -301,6 +318,8 @@ class CheckpointCandidateMixin:
         entry_source = entry.get("source")
         if not isinstance(entry_source, Mapping):
             return False, "entry_source_missing", None
+        if dict(entry_source) != dict(source_ref):
+            return False, "entry_source_join_mismatch", None
         if str(entry_source.get("source_kind", "")) not in {
             "official-live",
             "official-snapshot",
@@ -308,6 +327,11 @@ class CheckpointCandidateMixin:
             return False, "official_required", None
         if str(item.get("entry_id", entry_id)) != entry_id:
             return False, "entry_id_mismatch", None
+        if (
+            expected_parser_pin is not None
+            and str(entry_source.get("parser_version", "")) != expected_parser_pin
+        ):
+            return False, "parser_pin_mismatch", None
         if (
             str(parsed_payload.get("canonical_content_hash", expected_hash))
             != expected_hash
@@ -358,6 +382,16 @@ class CheckpointCandidateMixin:
             return False, "raw_source_join_mismatch", None
         if str(entry_source.get("content_hash", "")) != raw_hash:
             return False, "raw_entry_join_mismatch", None
+        observation_id = item.get("observation_id")
+        observation_reason = self._observation_join_reason(
+            source_ref=source_ref,
+            source_role=str(item.get("source_role", "official")),
+            raw_hash=raw_hash,
+            raw_snapshot_id=raw_snapshot_id,
+            observation_id=observation_id,
+        )
+        if observation_reason is not None:
+            return False, observation_reason, None
         return (
             True,
             None,
@@ -377,6 +411,37 @@ class CheckpointCandidateMixin:
                 "review_id": item.get("conflict_id") or item.get("review_id"),
             },
         )
+
+    def _observation_join_reason(
+        self: Any,
+        *,
+        source_ref: Mapping[str, Any],
+        source_role: str,
+        raw_hash: str,
+        raw_snapshot_id: str,
+        observation_id: Any,
+    ) -> str | None:
+        """Return a reason when the immutable observation join is invalid."""
+        if not isinstance(observation_id, str) or not observation_id:
+            return "observation_missing"
+        try:
+            observation = RawSnapshotStore(self.root).get_observation(observation_id)
+        except (OSError, ValueError, CheckpointError):
+            return "observation_missing"
+        observation_source = observation.get("source_ref")
+        if not isinstance(observation_source, Mapping):
+            return "observation_source_missing"
+        if dict(observation_source) != dict(source_ref):
+            return "observation_source_join_mismatch"
+        if str(observation.get("raw_snapshot_id", "")) != raw_snapshot_id:
+            return "observation_raw_join_mismatch"
+        if str(observation.get("raw_sha256", "")) != raw_hash:
+            return "observation_raw_join_mismatch"
+        if str(observation.get("raw_content_hash", "")) != raw_hash:
+            return "observation_raw_join_mismatch"
+        if str(observation.get("role", "")) != source_role:
+            return "observation_role_mismatch"
+        return None
 
     def candidate_evaluation(self: Any, run_id: str) -> dict[str, Any]:
         """Read a previously persisted candidate evaluation."""

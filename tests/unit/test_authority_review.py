@@ -268,6 +268,118 @@ def test_official_failure_reads_fallback_only_as_labeled_evidence(
     )
 
 
+def test_retryable_primary_selects_successful_backup_official(
+    tmp_path: Path,
+) -> None:
+    primary = _raw("primary")
+    backup = _raw("backup official")
+    catalog = _catalog(primary)
+    entry = dict(catalog["entries"][0])  # type: ignore[index]
+    primary_transport = dict(entry["transport"])  # type: ignore[index]
+    primary_transport["status"] = 503
+    entry["transport"] = primary_transport
+    backup_hash = content_hash_bytes(backup)
+    entry["observations"] = [
+        {
+            "role": "official",
+            "source_ref": _source(
+                backup,
+                kind="official-snapshot",
+                host="kbbi.kemdikbud.go.id",
+            ),
+            "transport": {
+                "adapter": "fixture",
+                "content": backup.decode(),
+                "content_type": "text/html",
+                "expected_raw_hash": backup_hash,
+                "comparison_mode": "exact",
+                "status": 200,
+            },
+        },
+        {
+            "role": "fallback",
+            "source_ref": _source(
+                backup,
+                kind="fallback",
+                host="kbbi.web.id",
+            ),
+            "transport": {
+                "adapter": "fixture",
+                "content": backup.decode(),
+                "content_type": "text/html",
+                "expected_raw_hash": backup_hash,
+                "comparison_mode": "exact",
+                "status": 200,
+            },
+        },
+    ]
+
+    driver = CheckpointDriver(root=tmp_path)
+    result = driver.run(
+        {**catalog, "entries": [entry]},
+        limit=1,
+        idempotency_key="backup-official",
+    )
+
+    outcome = result.report["outcomes"][0]
+    assert result.status == "completed"
+    assert outcome["outcome"] == "accepted"
+    assert outcome["source_ref"]["url"].endswith("/entri/kata")
+    assert outcome["source_ref"]["content_hash"] == backup_hash
+    assert outcome["source_role"] == "official"
+    assert outcome["official_observation"]["source_ref"]["content_hash"] == backup_hash
+    assert not ReviewStore(root=tmp_path).list_open()
+
+    attempt_history = driver.attempts(result.run_id)
+    assert attempt_history["attempt_count"] == 3
+    assert [
+        attempt["source_kind"] for attempt in attempt_history["physical_attempts"]
+    ] == ["official-snapshot", "official-snapshot", "fallback"]
+    assert attempt_history["physical_attempts"][0]["outcome"] == "retryable"
+    assert attempt_history["physical_attempts"][1]["outcome"] == "accepted"
+    assert attempt_history["physical_attempts"][2]["outcome"] == "accepted"
+
+
+def test_attempt_history_is_physical_and_keeps_logical_rows_separate(
+    tmp_path: Path,
+) -> None:
+    official = _raw()
+    fallback = _raw("makna cermin")
+    result = CheckpointDriver(root=tmp_path).run(
+        _catalog(official, fallback),
+        limit=1,
+        idempotency_key="physical-attempts",
+    )
+
+    report = result.report
+    assert report["outcome_counts"]["quarantined"] == 1
+    assert report["selected_count"] == 1
+    assert report["current_outcome_count"] == 1
+    assert report["logical_attempt_count"] == 1
+    assert report["attempt_count"] == 2
+    assert report["physical_attempt_count"] == 2
+    assert [attempt["source_kind"] for attempt in report["physical_attempts"]] == [
+        "official-snapshot",
+        "fallback",
+    ]
+    assert [attempt["sequence"] for attempt in report["physical_attempts"]] == [1, 2]
+    assert all(
+        attempt["run_id"] == result.run_id for attempt in report["physical_attempts"]
+    )
+    assert report["physical_attempts"][0]["canonical_content_hash"]
+    assert report["physical_attempts"][1]["canonical_content_hash"]
+    assert report["physical_attempts"][1]["conflict_result"] == "conflict"
+
+    attempt_history = CheckpointDriver(root=tmp_path).attempts(result.run_id)
+    assert attempt_history["logical_attempt_count"] == 1
+    assert len(attempt_history["attempts"]) == 1
+    assert len(attempt_history["physical_attempts"]) == 2
+    assert (
+        attempt_history["attempts"][0]["source_attempts"]
+        == (attempt_history["physical_attempts"])
+    )
+
+
 def test_candidate_requires_explicit_release_approval(tmp_path: Path) -> None:
     result = CheckpointDriver(root=tmp_path).run(
         _catalog(_raw()),
