@@ -95,11 +95,10 @@ def retrieve_semantic(
             entry = entry_store.get_by_id(entry_id) or entry_store.get_by_lema(lema)  # type: ignore[arg-type]
         if entry is None:
             continue
-        if getattr(entry, "source", None) and entry.source.source_kind in (
-            "enrichment",
-            "evaluation",
-            "ai-proposal",
-        ):  # type: ignore[union-attr]
+        if entry.status != "active" or entry.source.source_kind not in {
+            "official-live",
+            "official-snapshot",
+        }:
             continue
         results.append(
             {
@@ -415,6 +414,11 @@ class SemanticRetriever:
                 if entry is None:
                     continue
 
+            if entry.status != "active" or entry.source.source_kind not in {
+                "official-live",
+                "official-snapshot",
+            }:
+                continue
             hits.append(
                 SemanticHit(
                     entry=entry,

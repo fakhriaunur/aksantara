@@ -31,6 +31,11 @@ def retrieve_prefix(
                 return []
             results: list[KBBIEntry] = []
             for entry in store.all_entries():
+                if entry.status != "active" or entry.source.source_kind not in {
+                    "official-live",
+                    "official-snapshot",
+                }:
+                    continue
                 if entry.lema.lower().startswith(q):
                     results.append(entry)
                 for nb in entry.bentuk_tidak_baku:
@@ -116,7 +121,12 @@ class PrefixLookup:
                     if not isinstance(data, dict) or not data:
                         continue
                     try:
-                        out.append(KBBIEntry.model_validate(data))
+                        entry = KBBIEntry.model_validate(data)
+                        if entry.status == "active" and entry.source.source_kind in {
+                            "official-live",
+                            "official-snapshot",
+                        }:
+                            out.append(entry)
                     except Exception:
                         continue
                 if out:
@@ -141,7 +151,13 @@ class PrefixLookup:
             except Exception:
                 entries = []
 
-        matched = [e for e in entries if e.lema.lower().startswith(cleaned)]
+        matched = [
+            e
+            for e in entries
+            if e.status == "active"
+            and e.source.source_kind in {"official-live", "official-snapshot"}
+            and e.lema.lower().startswith(cleaned)
+        ]
         matched.sort(key=lambda e: e.lema.lower())
         return matched[:cap]
 

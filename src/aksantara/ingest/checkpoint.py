@@ -165,6 +165,10 @@ class CheckpointDriver(
                 },
                 "transport_adapter": "fixture",
                 "binding": "relative path under root or immutable inline bytes",
+                "changed_source_override": (
+                    "inline content may replace a path binding; all other "
+                    "multiple representations are rejected"
+                ),
                 "required_hash": "expected_raw_hash equals source_ref.content_hash and actual bytes",
                 "comparison_modes": ["exact", "sha256"],
                 "approved_hosts": sorted(_OFFICIAL_HOSTS | _FALLBACK_HOSTS),
@@ -262,11 +266,13 @@ class CheckpointDriver(
                 "create/start",
                 "status",
                 "report",
+                "run history",
                 "current outcomes",
                 "attempt history",
                 "idempotent execute/no-op",
                 "review queue/read/decision",
                 "candidate evaluation/read",
+                "public read-only replay",
             ],
         }
 
@@ -416,7 +422,59 @@ class CheckpointDriver(
             "run_id": run_id,
             "revision": payload.get("revision"),
             "attempt_count": payload.get("attempt_count"),
+            "logical_attempt_count": payload.get(
+                "logical_attempt_count", payload.get("attempt_count")
+            ),
+            "transport_attempt_count": payload.get(
+                "transport_attempt_count", payload.get("attempt_count")
+            ),
             "attempts": payload.get("attempts", []),
+        }
+
+    def history(self) -> dict[str, Any]:
+        """Read immutable report revisions for every run under this root."""
+        runs: list[dict[str, Any]] = []
+        if not self.state_root.is_dir():
+            return {
+                "schema_version": "checkpoint-history-v1",
+                "root_scope": str(self.root),
+                "count": 0,
+                "runs": runs,
+            }
+        for run_dir in sorted(self.state_root.iterdir(), key=lambda path: path.name):
+            if not run_dir.is_dir() or not (run_dir / "report.json").is_file():
+                continue
+            report = _read_json(run_dir / "report.json")
+            status = (
+                _read_json(run_dir / "status.json")
+                if (run_dir / "status.json").is_file()
+                else {}
+            )
+            runs.append(
+                {
+                    "run_id": str(report.get("run_id", run_dir.name)),
+                    "status": str(
+                        status.get("status", report.get("status", "unknown"))
+                    ),
+                    "revision": int(report.get("revision", status.get("revision", 0))),
+                    "snapshot": report.get("snapshot"),
+                    "run_fingerprint": report.get("fingerprints", {}).get("run"),
+                    "catalog_fingerprint": report.get("fingerprints", {}).get(
+                        "catalog"
+                    ),
+                    "selected_count": report.get("selected_count", 0),
+                    "processed_count": report.get("processed_count", 0),
+                    "references": report.get(
+                        "references", self._references(run_dir, run_dir.name)
+                    ),
+                    "immutable": True,
+                }
+            )
+        return {
+            "schema_version": "checkpoint-history-v1",
+            "root_scope": str(self.root),
+            "count": len(runs),
+            "runs": runs,
         }
 
     def checkpoint(self, run_id: str) -> dict[str, Any]:

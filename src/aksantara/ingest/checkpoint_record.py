@@ -8,8 +8,9 @@ from typing import Any, Protocol
 
 from aksantara.domain.errors import QuarantinedError, ValidationError
 from aksantara.domain.provenance import (
-    CANONICAL_CONTENT_FIELDS,
+    CANONICAL_RECORD_FIELDS,
     canonical_content_hash,
+    canonical_record_bytes,
     content_hash_bytes,
 )
 from aksantara.ingest.checkpoint_authority import _source_identity
@@ -386,6 +387,14 @@ def process_record(
     canonical_payload = entry.model_dump(mode="json")
     canonical_hash = canonical_content_hash(entry)
     parsed_path = run_dir / "parsed" / f"{record.stable_key.replace(' ', '_')}.json"
+    canonical_path = (
+        run_dir / "canonical" / f"{record.stable_key.replace(' ', '_')}.json"
+    )
+    _write_immutable(
+        canonical_path,
+        canonical_record_bytes(entry),
+        driver.root,
+    )
     _write_json(
         parsed_path,
         {
@@ -394,9 +403,14 @@ def process_record(
             "entry": canonical_payload,
             "canonical_content_hash": canonical_hash,
             "canonical_serialization": {
-                "algorithm": "canonical-content-v1",
-                "fields": list(CANONICAL_CONTENT_FIELDS),
+                "algorithm": "canonical-record-v1",
+                "fields": list(CANONICAL_RECORD_FIELDS),
+                "encoding": "UTF-8",
+                "separators": [",", ":"],
+                "sort_keys": True,
+                "final_newline": True,
             },
+            "canonical_reference": _safe_relative(driver.root, canonical_path),
             "candidate_namespace": False,
         },
         driver.root,
@@ -454,6 +468,13 @@ def process_record(
                 "canonical_content_hash": canonical_hash,
                 "raw_reference": _safe_relative(driver.root, raw_path),
                 "parsed_reference": _safe_relative(driver.root, parsed_path),
+                "canonical_reference": _safe_relative(driver.root, canonical_path),
+                "canonical_serialization": {
+                    "algorithm": "canonical-record-v1",
+                    "fields": list(CANONICAL_RECORD_FIELDS),
+                    "encoding": "UTF-8",
+                    "final_newline": True,
+                },
                 "source_ref": _source_identity(source_ref),
                 "raw_snapshot_id": raw_observation["raw_snapshot_id"],
                 "observation_id": raw_observation["observation_id"],
@@ -478,6 +499,13 @@ def process_record(
             "canonical_content_hash": canonical_hash,
             "raw_reference": _safe_relative(driver.root, raw_path),
             "parsed_reference": _safe_relative(driver.root, parsed_path),
+            "canonical_reference": _safe_relative(driver.root, canonical_path),
+            "canonical_serialization": {
+                "algorithm": "canonical-record-v1",
+                "fields": list(CANONICAL_RECORD_FIELDS),
+                "encoding": "UTF-8",
+                "final_newline": True,
+            },
             "source_ref": _source_identity(source_ref),
             "raw_snapshot_id": raw_observation["raw_snapshot_id"],
             "observation_id": raw_observation["observation_id"],

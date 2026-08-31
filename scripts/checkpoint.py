@@ -107,6 +107,7 @@ def _parser() -> argparse.ArgumentParser:
         ("report", "Read a conserved durable run report"),
         ("outcomes", "Read one current outcome per selected key"),
         ("attempts", "Read per-source attempt history"),
+        ("history", "Read immutable checkpoint run history"),
         ("checkpoint", "Read the durable checkpoint revision"),
         ("execute", "Read an existing run as an idempotent no-op"),
         ("review-queue", "Read the deterministic open authority review queue"),
@@ -194,6 +195,8 @@ def _operation(args: argparse.Namespace) -> Any:
             "count": len(reviews),
             "reviews": reviews,
         }
+    if operation == "history":
+        return driver.history()
     if operation == "review-read":
         if not args.review_id:
             raise CheckpointNotFoundError(

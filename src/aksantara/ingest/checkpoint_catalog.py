@@ -367,7 +367,10 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
         for name in ("path", "bytes", "raw_bytes", "content", "base64")
         if name in payload
     ]
-    if len(binding_names) > 1:
+    # ``content`` is a deliberate immutable replacement for a path binding.
+    # This lets a caller rerun a source under new bytes without mutating the
+    # original fixture file; all other combinations remain ambiguous.
+    if len(binding_names) > 1 and set(binding_names) != {"path", "content"}:
         raise CatalogValidationError(
             "transport must bind exactly one immutable fixture representation",
             details={"fields": binding_names, "stable_key": stable_key},
@@ -379,7 +382,33 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
         "comparison_mode": comparison_mode,
         "expected_raw_hash": expected_raw_hash,
     }
-    if "path" in payload:
+    if "content" in payload:
+        content = payload["content"]
+        if not isinstance(content, str):
+            raise CatalogValidationError("transport.content must be a UTF-8 string")
+        if "path" in payload:
+            path_value = payload["path"]
+            if not isinstance(path_value, str) or not path_value.strip():
+                raise CatalogValidationError(
+                    "transport.path must be a non-empty string"
+                )
+            relative = Path(path_value)
+            if relative.is_absolute() or _CONTROL_RE.search(path_value):
+                raise CatalogValidationError(
+                    "transport.path must be a safe relative path",
+                    details={"path": path_value},
+                )
+            try:
+                resolved = (root / relative).resolve()
+                resolved.relative_to(root)
+            except (OSError, ValueError) as exc:
+                raise CatalogValidationError(
+                    "transport.path escapes caller root",
+                    details={"path": path_value, "root": str(root)},
+                ) from exc
+        result["bytes"] = content.encode("utf-8")
+        result["binding"] = "inline-content-override"
+    elif "path" in payload:
         path_value = payload["path"]
         if not isinstance(path_value, str) or not path_value.strip():
             raise CatalogValidationError("transport.path must be a non-empty string")
@@ -410,11 +439,6 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
                 "transport.bytes must be bytes for Python callers; use base64 in JSON"
             )
         result["bytes"] = byte_value
-    elif "content" in payload:
-        content = payload["content"]
-        if not isinstance(content, str):
-            raise CatalogValidationError("transport.content must be a UTF-8 string")
-        result["bytes"] = content.encode("utf-8")
     elif "base64" in payload:
         encoded = payload["base64"]
         if not isinstance(encoded, str):

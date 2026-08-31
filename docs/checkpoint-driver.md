@@ -25,6 +25,7 @@ The CLI operations are:
 | `report` | Reads the conserved current-outcome report |
 | `outcomes` | Reads one current outcome row per selected key |
 | `attempts` | Reads the separate attempt history |
+| `history` | Reads immutable report revisions for all runs under a root |
 | `checkpoint` | Reads the committed checkpoint revision and bounded cursor |
 | `execute` | Reads an existing run as an idempotent no-op |
 | `review-queue` | Reads open authority reviews in stable key/review ID order |
@@ -47,6 +48,7 @@ GET  /checkpoints/runs/{run_id}
 GET  /checkpoints/runs/{run_id}/report
 GET  /checkpoints/runs/{run_id}/outcomes
 GET  /checkpoints/runs/{run_id}/attempts
+GET  /checkpoints/runs/history
 GET  /checkpoints/runs/{run_id}/checkpoint
 GET  /checkpoints/reviews
 GET  /checkpoints/reviews/{review_id}
@@ -103,8 +105,10 @@ The catalog is caller-owned JSON. Its identity and every entry are required:
 `transport.path` is relative to the caller root and must resolve to an
 existing file below that root. Inline callers may instead use immutable
 `content`, `base64`, or Python-only `bytes`. A successful fixture must bind
-exactly one representation. The adapter computes SHA-256 from actual bytes;
-declared hashes are checked, not trusted.
+exactly one representation, except that an inline `content` value may
+explicitly replace a path binding for a changed-source lineage test. The
+adapter computes SHA-256 from actual bytes; declared hashes are checked, not
+trusted.
 
 The adapter accepts official KBBI hosts (`kbbi.kemdikbud.go.id`) and the
 labelled fallback host (`kbbi.web.id`) for evidence. The source kind must agree
@@ -175,6 +179,7 @@ Artifacts are written below:
         preflight.json
         raw/<raw-sha256>.bin
         parsed/<stable-key>.json
+        canonical/<stable-key>.json
         outcomes.json
         attempts.json
         checkpoint.json
@@ -207,3 +212,24 @@ The checkpoint report itself does not implicitly create a candidate and always
 states `pointer_changed=false` and `release_operation=not_invoked`. Candidate
 evaluation is a separate explicit operation; embedding, release promotion, and
 pointer changes remain outside this driver.
+
+## Public deterministic replay
+
+Replay is a separate, read-only operation for one caller-owned snapshot. It
+verifies the actual raw SHA-256 and the `SourceRef` identity before invoking
+the deterministic parser. It does not fetch the source URL, call an LLM,
+repair checkpoint state, or write canonical/candidate/release/pointer state:
+
+```bash
+python scripts/replay.py februari \
+  --root . \
+  --raw tests/replay/fixtures/februari.html \
+  --retrieved-at 2026-08-31T00:00:00Z \
+  --source-version VI --json
+```
+
+The response includes raw and canonical-record hashes, serialization and
+parser/transform/policy pins, and `"writes":{"count":0}`. Use
+`--expected-canonical-hash` when replaying against a previously published
+canonical hash. Changed bytes, source identity, or pins return a structured
+nonzero error and never silently normalize the input.

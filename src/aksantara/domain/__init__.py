@@ -17,9 +17,12 @@ from aksantara.domain.errors import (
 from aksantara.domain.models import KBBIEntry, ReviewStatus, SourceRef, Status
 from aksantara.domain.provenance import (
     CANONICAL_CONTENT_FIELDS,
+    CANONICAL_RECORD_FIELDS,
     canonical_content_hash,
     canonical_content_payload,
     canonical_json_hash,
+    canonical_record_bytes,
+    canonical_record_hash,
     content_hash,
     content_hash_bytes,
     verify_content_hash,
@@ -28,6 +31,7 @@ from aksantara.domain.provenance import (
 __all__ = [
     "AUTHORITY_TO_SOURCE_KIND",
     "CANONICAL_CONTENT_FIELDS",
+    "CANONICAL_RECORD_FIELDS",
     "DEFAULT_VALIDATION_POLICY",
     "AksantaraDomainError",
     "AuthorityLayer",
@@ -44,6 +48,8 @@ __all__ = [
     "canonical_content_hash",
     "canonical_content_payload",
     "canonical_json_hash",
+    "canonical_record_bytes",
+    "canonical_record_hash",
     "content_hash",
     "content_hash_bytes",
     "verify_content_hash",

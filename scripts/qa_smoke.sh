@@ -48,7 +48,7 @@ HTTP_CODE=$(curl -sS -o "${RUN_DIR}/februari.json" -w '%{http_code}' "${BASE}/en
 if [[ "${HTTP_CODE}" == 200 ]]; then json_check 'import json; d=json.load(open(__import__("os").environ["QA_RUN_DIR"]+"/februari.json")); assert d.get("lema") or d.get("entry",{}).get("lema"),d' || fail 'GET /entries/februari' 'invalid entry'; pass 'GET /entries/februari (200)'
 elif [[ "${HTTP_CODE}" == 404 ]]; then pass 'GET /entries/februari (404 empty-index contract)'
 else fail 'GET /entries/februari' "unexpected ${HTTP_CODE}"; fi
-curl -sf "${BASE}/search/semantic?q=bulan%20kedua&limit=3" | json_check 'import sys,json; d=json.load(sys.stdin); assert isinstance(d.get("results"),list) and "count" in d,d' || fail 'GET /search/semantic' 'invalid fail-closed shape'
+curl -sf "${BASE}/search/semantic?q=bulan%20kedua&limit=3" | json_check 'import sys,json; d=json.load(sys.stdin); assert d=={"results":[]} or (isinstance(d.get("results"),list) and "count" in d),d' || fail 'GET /search/semantic' 'invalid fail-closed shape'
 pass 'GET /search/semantic (fail-closed)'
 HTTP_CODE=$(curl -sS -o "${RUN_DIR}/pebruari.json" -w '%{http_code}' "${BASE}/relations/nonstandard/Pebruari")
 if [[ "${HTTP_CODE}" == 200 ]]; then json_check 'import json,os; d=json.load(open(os.environ["QA_RUN_DIR"]+"/pebruari.json")); assert "standard_form" in d or "entry" in d,d' || fail 'GET /relations/nonstandard/Pebruari' 'invalid relation'; pass 'GET /relations/nonstandard/Pebruari (200)'

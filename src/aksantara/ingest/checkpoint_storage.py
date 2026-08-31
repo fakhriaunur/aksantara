@@ -72,12 +72,16 @@ def _write_state_json(path: Path, payload: Any, root: Path) -> None:
             "state path escapes caller root",
             details={"path": str(path), "root": str(root)},
         ) from exc
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.state.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.state.tmp")
         temporary.write_bytes(data)
         os.replace(temporary, path)
     except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise CheckpointPersistenceError(
             "caller-owned state write failed",
             details={"path": str(path), "error_type": type(exc).__name__},
@@ -92,6 +96,7 @@ def _write_immutable(path: Path, data: bytes, root: Path) -> None:
             "artifact path escapes caller root",
             details={"path": str(path), "root": str(root)},
         ) from exc
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
@@ -102,14 +107,21 @@ def _write_immutable(path: Path, data: bytes, root: Path) -> None:
                     details={"path": str(path)},
                 )
             return
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         if temporary.exists():
             temporary.unlink()
         temporary.write_bytes(data)
         os.replace(temporary, path)
     except CheckpointPersistenceError:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
     except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise CheckpointPersistenceError(
             "caller-owned artifact write failed",
             details={"path": str(path), "error_type": type(exc).__name__},

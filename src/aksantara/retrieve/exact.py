@@ -14,6 +14,14 @@ from aksantara.domain.models import KBBIEntry
 __all__ = ["ExactLookup", "InMemoryEntryStore", "InMemoryExactIndex", "retrieve_exact"]
 
 
+def _is_active_official_entry(entry: KBBIEntry) -> bool:
+    """Keep public retrieval helpers inside the active official boundary."""
+    return entry.status == "active" and entry.source.source_kind in {
+        "official-live",
+        "official-snapshot",
+    }
+
+
 class InMemoryExactIndex:
     """Minimal in-memory exact index for tests and local smoke (spec name)."""
 
@@ -40,7 +48,9 @@ class InMemoryExactIndex:
     def get_by_nonstandard(self, word: str) -> KBBIEntry | None:
         lowered = word.strip().lower()
         for e in self._by_id.values():
-            if any(v.lower() == lowered for v in e.bentuk_tidak_baku):
+            if _is_active_official_entry(e) and any(
+                v.lower() == lowered for v in e.bentuk_tidak_baku
+            ):
                 return e
         return None
 
@@ -87,7 +97,8 @@ def retrieve_exact(
     query: str, store: InMemoryEntryStore | InMemoryExactIndex
 ) -> KBBIEntry | None:
     """Exact lema lookup (case-insensitive) — legacy helper."""
-    return store.get_by_lema(query.strip())  # type: ignore[arg-type]
+    entry = store.get_by_lema(query.strip())  # type: ignore[arg-type]
+    return entry if entry is not None and _is_active_official_entry(entry) else None
 
 
 class ExactLookup:
@@ -120,12 +131,17 @@ class ExactLookup:
                     data = doc.to_dict() if hasattr(doc, "to_dict") else {}
                     if isinstance(data, dict) and data:
                         try:
-                            return KBBIEntry.model_validate(data)
+                            entry = KBBIEntry.model_validate(data)
+                            if _is_active_official_entry(entry):
+                                return entry
                         except Exception:
                             pass
             except Exception:
                 pass
-        return self._index.get_by_lema(cleaned)  # type: ignore[attr-defined]
+        indexed_entry = self._index.get_by_lema(cleaned)  # type: ignore[attr-defined]
+        if indexed_entry is None:
+            return None
+        return indexed_entry if _is_active_official_entry(indexed_entry) else None
 
     def __call__(self, lema: str) -> KBBIEntry | None:
         return self.lookup(lema)

@@ -26,6 +26,7 @@ with the ``get_*`` dependency functions exposed below.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -33,6 +34,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from aksantara.api.checkpoint_routes import create_checkpoint_router
+from aksantara.api.replay_routes import create_replay_router
 from aksantara.domain.models import KBBIEntry
 from aksantara.retrieve.citations import RetrievalInfo, render_citation
 from aksantara.retrieve.exact import ExactLookup, InMemoryExactIndex
@@ -174,6 +176,69 @@ def _entry_to_api_dict(entry: KBBIEntry) -> dict[str, Any]:
     return d
 
 
+def _is_active_official_entry(entry: KBBIEntry) -> bool:
+    """Keep API reads inside the validated active canonical boundary."""
+    return entry.status == "active" and entry.source.source_kind in {
+        "official-live",
+        "official-snapshot",
+    }
+
+
+def _active_official_entries(entries: Iterable[KBBIEntry]) -> list[KBBIEntry]:
+    """Filter any adapter result to the public active official boundary."""
+    return [entry for entry in entries if _is_active_official_entry(entry)]
+
+
+def _semantic_results(hits: Iterable[Any]) -> list[dict[str, Any]]:
+    """Serialize only active official entries returned by semantic adapters."""
+    results: list[dict[str, Any]] = []
+    for hit in hits:
+        if not _is_active_official_entry(hit.entry):
+            continue
+        retrieval = RetrievalInfo(
+            mode="semantic",
+            distance=hit.distance,
+            threshold=hit.threshold,
+            distance_result_field=hit.distance_result_field,
+        )
+        results.append(_build_entry_result(hit.entry, retrieval))
+    return results
+
+
+def _nonstandard_candidates(
+    entries: Iterable[KBBIEntry],
+    *,
+    lowered: str,
+    exact: Any,
+) -> list[KBBIEntry]:
+    """Resolve active official entries for a nonstandard relation lookup."""
+    candidates: list[KBBIEntry] = []
+    for entry in _active_official_entries(entries):
+        if any(value.lower() == lowered for value in entry.bentuk_tidak_baku):
+            candidates.append(entry)
+        if entry.bentuk_baku and entry.bentuk_baku.lower() == lowered:
+            standard = exact.lookup(entry.bentuk_baku)
+            if standard is not None and _is_active_official_entry(standard):
+                candidates.append(standard)
+    return candidates
+
+
+def _active_firestore_candidates(snaps: Iterable[Any]) -> list[KBBIEntry]:
+    """Validate and filter Firestore relation snapshots at the API boundary."""
+    candidates: list[KBBIEntry] = []
+    for snap in snaps:
+        data = snap.to_dict() if hasattr(snap, "to_dict") else {}
+        if not isinstance(data, dict) or not data:
+            continue
+        try:
+            candidate = KBBIEntry.model_validate(data)
+        except Exception:
+            continue
+        if _is_active_official_entry(candidate):
+            candidates.append(candidate)
+    return candidates
+
+
 def _build_entry_result(entry: KBBIEntry, retrieval: RetrievalInfo) -> dict[str, Any]:
     entry_dict = _entry_to_api_dict(entry)
     citation = render_citation(entry, retrieval=retrieval)
@@ -313,7 +378,7 @@ def create_router(
                 status_code=400,
                 detail="query param q is required for prefix search; use /entries/{lema} for exact lookup",
             )
-        hits = prefix_resolver.lookup(q, limit=limit)
+        hits = _active_official_entries(prefix_resolver.lookup(q, limit=limit))
         results = [_build_entry_result(e, RetrievalInfo(mode="prefix")) for e in hits]
         return {"query": q, "count": len(results), "results": results}
 
@@ -325,7 +390,7 @@ def create_router(
         exact: ExactLookup = Depends(_exact),
     ) -> dict[str, Any]:
         entry = exact.lookup(lema)
-        if entry is None:
+        if entry is None or not _is_active_official_entry(entry):
             raise HTTPException(status_code=404, detail=f"entry not found: {lema}")
         retrieval = RetrievalInfo(mode="exact")
         result = _build_entry_result(entry, retrieval)
@@ -349,22 +414,14 @@ def create_router(
         limit: int = Query(default=10, ge=1, le=50),
         semantic: SemanticRetriever | None = Depends(_semantic),
     ) -> dict[str, Any]:
-        if not q.strip():
-            return {"query": q, "count": 0, "results": []}
         if semantic is None:
             # No embedding/vector backend configured — fail-closed rather than
             # raising 500 so the slice can boot without credentials.
+            return {"results": []}
+        if not q.strip():
             return {"query": q, "count": 0, "results": []}
         hits = semantic.search(q, limit=limit)
-        results = []
-        for h in hits:
-            retrieval = RetrievalInfo(
-                mode="semantic",
-                distance=h.distance,
-                threshold=h.threshold,
-                distance_result_field=h.distance_result_field,
-            )
-            results.append(_build_entry_result(h.entry, retrieval))
+        results = _semantic_results(hits)
         return {"query": q, "count": len(results), "results": results}
 
     # -- nonstandard relations ---------------------------------------------
@@ -383,7 +440,7 @@ def create_router(
         # Direct exact match first — if the word itself is a lema, return its
         # standard/variant metadata.
         direct = exact.lookup(lowered)
-        if direct is not None:
+        if direct is not None and _is_active_official_entry(direct):
             retrieval = RetrievalInfo(mode="nonstandard")
             citation = render_citation(direct, retrieval=retrieval)
             entry_dict = _entry_to_api_dict(direct)
@@ -410,15 +467,13 @@ def create_router(
         idx = getattr(exact, "_index", None)
         if idx is not None and hasattr(idx, "all_entries"):
             try:
-                for e in idx.all_entries():  # type: ignore[attr-defined]
-                    if any(v.lower() == lowered for v in e.bentuk_tidak_baku):
-                        candidates.append(e)
-                    # Also handle bentuk_baku pointer: entry is nonstandard variant record.
-                    if e.bentuk_baku and e.bentuk_baku.lower() == lowered:
-                        # This entry points to its standard; try resolving standard.
-                        std = exact.lookup(e.bentuk_baku)
-                        if std is not None:
-                            candidates.append(std)
+                candidates.extend(
+                    _nonstandard_candidates(
+                        idx.all_entries(),  # type: ignore[attr-defined]
+                        lowered=lowered,
+                        exact=exact,
+                    )
+                )
             except Exception:
                 pass
 
@@ -448,13 +503,7 @@ def create_router(
                             "bentuk_tidak_baku", "array_contains", cleaned
                         )  # type: ignore[call-arg]
                         snaps = list(q.stream() if hasattr(q, "stream") else [])  # type: ignore[attr-defined]
-                    for snap in snaps:
-                        data = snap.to_dict() if hasattr(snap, "to_dict") else {}
-                        if isinstance(data, dict) and data:
-                            try:
-                                candidates.append(KBBIEntry.model_validate(data))
-                            except Exception:
-                                continue
+                    candidates.extend(_active_firestore_candidates(snaps))
                 except Exception:
                     pass
 
@@ -615,6 +664,7 @@ def create_app(
     )
     app.include_router(router)
     app.include_router(create_checkpoint_router())
+    app.include_router(create_replay_router())
 
     # Expose a simple root redirect for convenience.
     @app.get("/", include_in_schema=False)

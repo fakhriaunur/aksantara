@@ -90,6 +90,59 @@ def test_driver_selects_exactly_100_and_rerun_is_idempotent(tmp_path: Path) -> N
     second = driver.run(manifest, limit=100, idempotency_key="same-run")
     assert second.run_id == first.run_id
     assert driver.report(second.run_id)["revision"] == report["revision"]
+    assert report["processed_count"] == 100
+    assert report["conservation"]["partition_holds"] is True
+    assert len(report["accepted_joins"]) == 100
+    assert report["excluded_keys"] == []
+
+
+def test_report_excludes_nonaccepted_keys_and_history_is_immutable(
+    tmp_path: Path,
+) -> None:
+    manifest = _catalog(tmp_path, count=2)
+    entries = list(manifest["entries"])  # type: ignore[arg-type]
+    failed = dict(entries[1])
+    failed_transport = dict(failed["transport"])  # type: ignore[index]
+    failed_transport["status"] = 404
+    failed["transport"] = failed_transport
+    manifest = {**manifest, "entries": [entries[0], failed]}
+
+    driver = CheckpointDriver(root=tmp_path)
+    first = driver.run(manifest, limit=2, idempotency_key="report-history")
+    before = driver.report(first.run_id)
+
+    assert before["processed_count"] == 2
+    assert before["selected_count"] == 2
+    assert before["excluded_keys"] == ["entry-001"]
+    assert before["exclusions"][0]["eligible"] is False
+    assert (
+        before["accepted_joins"][0]["run_fingerprint"] == before["fingerprints"]["run"]
+    )
+
+    changed = dict(entries[0])
+    changed_transport = dict(changed["transport"])  # type: ignore[index]
+    changed_transport["content"] = (
+        "<entry><h1>entry-000</h1><p class='makna'>new</p></entry>"
+    )
+    changed_transport["expected_raw_hash"] = content_hash_bytes(
+        changed_transport["content"].encode()
+    )
+    changed_source = dict(changed["source_ref"])  # type: ignore[index]
+    changed_source["content_hash"] = changed_transport["expected_raw_hash"]
+    changed["source_ref"] = changed_source
+    changed["transport"] = changed_transport
+    second = driver.run(
+        {**manifest, "entries": [changed, entries[1]]},
+        limit=2,
+        idempotency_key="report-history-v2",
+    )
+
+    assert second.run_id != first.run_id
+    assert driver.report(first.run_id) == before
+    history = driver.history()
+    assert [item["run_id"] for item in history["runs"]] == sorted(
+        item["run_id"] for item in history["runs"]
+    )
 
 
 def test_lower_limit_is_processed_but_not_a_complete_fixed_checkpoint(

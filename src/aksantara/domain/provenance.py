@@ -9,7 +9,7 @@ Determinism rules:
 - Hash is always hex-encoded lower-case sha256.
 - Str input is encoded as UTF-8 before hashing.
 - Dict/list canonical JSON uses sort_keys=True, separators=(',', ':'),
-  ensure_ascii=False to guarantee cross-run stability.
+  ensure_ascii=False, and one final UTF-8 newline for published records.
 
 No I/O in this module; pure functions only.
 """
@@ -40,6 +40,18 @@ CANONICAL_CONTENT_FIELDS: tuple[str, ...] = (
     "etimologi",
     "labels",
     "status",
+)
+
+# KBBIEntry fields are serialized in this fixed published-record contract.
+# ``json.dumps(sort_keys=True)`` gives nested mappings a stable order while
+# this tuple keeps the top-level field set explicit and reviewable.
+CANONICAL_RECORD_FIELDS: tuple[str, ...] = (
+    *CANONICAL_CONTENT_FIELDS,
+    "source",
+    "parser_version",
+    "transform_version",
+    "review_status",
+    "confidence",
 )
 
 
@@ -108,9 +120,51 @@ def canonical_content_payload(entry: Any) -> dict[str, Any]:
     }
 
 
+def canonical_record_payload(entry: Any) -> dict[str, Any]:
+    """Return the exact field set used by published canonical records.
+
+    The payload includes lexical values and their provenance/version joins.
+    Retrieval timestamps are retained because they are part of the immutable
+    ``SourceRef`` supplied to replay.  Callers that intentionally compare
+    separate retrieval observations should normalize that documented volatile
+    field before comparing results, rather than silently changing the hash
+    contract.
+    """
+    if hasattr(entry, "model_dump"):
+        value = entry.model_dump(mode="json")
+    elif isinstance(entry, dict):
+        value = entry
+    else:
+        raise TypeError("entry must be a KBBIEntry or mapping")
+    return {field: value[field] for field in CANONICAL_RECORD_FIELDS if field in value}
+
+
+def canonical_record_bytes(entry: Any) -> bytes:
+    """Serialize a canonical record using the published UTF-8 JSON contract.
+
+    Rules are sorted JSON object keys, compact separators, UTF-8 without
+    ASCII escaping, and exactly one final newline.  The same bytes are the
+    preimage for :func:`canonical_content_hash`.
+    """
+    return (
+        json.dumps(
+            canonical_record_payload(entry),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
 def canonical_content_hash(entry: Any) -> str:
-    """Hash the deterministic lexical serialization of ``entry``."""
-    return canonical_json_hash(canonical_content_payload(entry))
+    """Hash the exact published canonical-record serialization of ``entry``."""
+    return content_hash_bytes(canonical_record_bytes(entry))
+
+
+def canonical_record_hash(entry: Any) -> str:
+    """Explicit alias for callers that prefer the record-oriented name."""
+    return canonical_content_hash(entry)
 
 
 def verify_content_hash(data: bytes, expected_hex: str) -> bool:
@@ -130,9 +184,12 @@ def verify_content_hash(data: bytes, expected_hex: str) -> bool:
 
 __all__ = [
     "CANONICAL_CONTENT_FIELDS",
+    "CANONICAL_RECORD_FIELDS",
     "canonical_content_hash",
     "canonical_content_payload",
     "canonical_json_hash",
+    "canonical_record_bytes",
+    "canonical_record_hash",
     "content_hash",
     "content_hash_bytes",
     "verify_content_hash",

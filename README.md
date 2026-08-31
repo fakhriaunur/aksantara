@@ -103,10 +103,14 @@ python scripts/checkpoint.py preflight --root /tmp/aksantara-checkpoint --catalo
 python scripts/checkpoint.py run --root /tmp/aksantara-checkpoint --catalog catalog.json --limit 100 --idempotency-key demo --json
 python scripts/checkpoint.py status --root /tmp/aksantara-checkpoint --run-id checkpoint-<fingerprint> --json
 python scripts/checkpoint.py report --root /tmp/aksantara-checkpoint --run-id checkpoint-<fingerprint> --json
+python scripts/replay.py februari --root . \
+  --raw tests/replay/fixtures/februari.html \
+  --retrieved-at 2026-08-31T00:00:00Z --source-version VI --json
 ```
 
 The complete catalog schema, fingerprint preimages, lifecycle, error mapping,
-and FastAPI `/checkpoints/*` operations are documented in
+immutable report history, public replay contract, and FastAPI
+`/checkpoints/*` operations are documented in
 [`docs/checkpoint-driver.md`](docs/checkpoint-driver.md). An accepted
 checkpoint is evidence only, never an implicit candidate or release.
 
@@ -140,6 +144,7 @@ curl -s "http://127.0.0.1:8000/search/semantic?q=bulan%20kedua&limit=3" | jq .re
 curl -s http://127.0.0.1:8000/relations/nonstandard/Pebruari | jq .standard_form
 curl -s http://127.0.0.1:8000/versions/current | jq .version
 curl -s http://127.0.0.1:8000/docs | head -20  # OpenAPI UI
+# -> no configured semantic backend: {"results":[]}
 
 # 5. Replay and retrieval slice (deterministic, no network)
 mise run replay  # pytest tests/replay -v (Februari fixture, hash 35a702...)

@@ -125,7 +125,7 @@ class CheckpointExecutionMixin:
         attempts: list[dict[str, Any]] = []
         for selected_index, record in enumerate(preflight.selected):
             outcome, attempt = self._process_record(record, run_dir, selected_index)
-            outcomes.append(outcome)
+            outcomes.append(self._annotate_outcome(outcome, run_id=run_id))
             attempts.append(attempt)
 
         outcome_counts = dict.fromkeys(_OUTCOMES, 0)
@@ -207,7 +207,9 @@ class CheckpointExecutionMixin:
                 "schema_version": CHECKPOINT_SCHEMA_VERSION,
                 "run_id": run_id,
                 "revision": revision,
-                "attempt_count": len(attempts),
+                "attempt_count": self._transport_attempt_count(attempts),
+                "logical_attempt_count": len(attempts),
+                "transport_attempt_count": self._transport_attempt_count(attempts),
                 "attempts": attempts,
             },
             self.root,
@@ -227,6 +229,12 @@ class CheckpointExecutionMixin:
                 },
                 "selected_keys": preflight.selected_keys,
                 "outcome_counts": outcome_counts,
+                "processed_count": len(outcomes),
+                "terminal_count": sum(
+                    count
+                    for name, count in outcome_counts.items()
+                    if name in _TERMINAL_OUTCOMES
+                ),
                 "outcomes_reference": "outcomes.json",
                 "attempts_reference": "attempts.json",
             },
@@ -267,6 +275,35 @@ class CheckpointExecutionMixin:
         selected_index: int,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         return process_record(self, record, run_dir, selected_index)
+
+    @staticmethod
+    def _annotate_outcome(outcome: Mapping[str, Any], *, run_id: str) -> dict[str, Any]:
+        """Add report-level aliases while retaining the processor evidence."""
+        value = dict(outcome)
+        status = str(value.get("outcome", ""))
+        value["source_key"] = str(value.get("stable_key", ""))
+        value["current"] = True
+        value["eligible"] = status == "accepted"
+        value["candidate_member"] = False
+        value["attempt_number"] = int(value.get("attempt_count", 1))
+        value["last_transition"] = status
+        value["error_class"] = (
+            value.get("exclusion_reason") if status != "accepted" else None
+        )
+        value["raw_content_hash"] = value.get("raw_hash")
+        value["canonical_hash"] = value.get("canonical_content_hash")
+        value["attempt_history_reference"] = "attempts.json"
+        value["attempt_run_id"] = run_id
+        return value
+
+    @staticmethod
+    def _transport_attempt_count(attempts: list[dict[str, Any]]) -> int:
+        """Count physical source attempts separately from logical key rows."""
+        total = 0
+        for attempt in attempts:
+            source_attempts = attempt.get("source_attempts")
+            total += len(source_attempts) if isinstance(source_attempts, list) else 1
+        return total
 
     def _fixture_bytes_for_transport(self, transport: Mapping[str, Any]) -> bytes:
         if "bytes" in transport:
@@ -322,20 +359,66 @@ class CheckpointExecutionMixin:
         exclusions = [
             {
                 "stable_key": item["stable_key"],
+                "source_key": item["stable_key"],
                 "reason": item.get(
                     "exclusion_reason", item.get("reason", "not_eligible")
                 ),
                 "outcome": item["outcome"],
+                "eligible": False,
+                "candidate_member": False,
+                "current_citation": None,
             }
             for item in outcomes
             if item["outcome"] != "accepted"
         ]
+        accepted_joins = [
+            {
+                "stable_key": item["stable_key"],
+                "source_key": item["stable_key"],
+                "entry_id": item.get("entry_id"),
+                "run_id": run_id,
+                "run_fingerprint": preflight.run_fingerprint,
+                "source_ref": item.get("source_ref"),
+                "raw_hash": item.get("raw_hash"),
+                "raw_content_hash": item.get("raw_hash"),
+                "canonical_hash": item.get("canonical_content_hash"),
+                "canonical_content_hash": item.get("canonical_content_hash"),
+                "raw_snapshot_id": item.get("raw_snapshot_id"),
+                "observation_id": item.get("observation_id"),
+                "canonical_reference": item.get("canonical_reference"),
+                "parsed_reference": item.get("parsed_reference"),
+                "eligible": True,
+                "candidate_member": False,
+            }
+            for item in outcomes
+            if item["outcome"] == "accepted"
+        ]
+        terminal_count = sum(
+            count
+            for name, count in outcome_counts.items()
+            if name in _TERMINAL_OUTCOMES
+        )
+        pending_count = sum(
+            count
+            for name, count in outcome_counts.items()
+            if name in {"pending", "in_progress", "retryable"}
+        )
         return {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "run_id": run_id,
             "status": status,
             "revision": revision,
             "snapshot": f"{run_id}:r{revision}",
+            "revision_history": [
+                {
+                    "revision": revision,
+                    "snapshot": f"{run_id}:r{revision}",
+                    "report_reference": "report.json",
+                    "outcomes_reference": "outcomes.json",
+                    "attempts_reference": "attempts.json",
+                    "immutable": True,
+                }
+            ],
             "corpus": {
                 "catalog_id": preflight.catalog_id,
                 "corpus_version": preflight.corpus_version,
@@ -351,14 +434,23 @@ class CheckpointExecutionMixin:
             },
             "selected_keys": preflight.selected_keys,
             "selected_count": len(preflight.selected),
+            "processed_count": len(outcomes),
+            "terminal_count": terminal_count,
+            "pending_count": pending_count,
             "current_outcome_count": len(outcomes),
             "outcome_counts": outcome_counts,
             "outcomes": outcomes,
-            "attempt_count": len(attempts),
+            "attempt_count": self._transport_attempt_count(attempts),
+            "logical_attempt_count": len(attempts),
+            "transport_attempt_count": self._transport_attempt_count(attempts),
             "exclusions": exclusions,
+            "excluded_keys": [item["stable_key"] for item in exclusions],
+            "accepted_joins": accepted_joins,
             "completion": {
                 "state": "blocked" if status == "blocked" else "completed",
                 "terminal": True,
+                "resumable": False,
+                "all_outcomes_terminal": pending_count == 0,
                 "checkpoint_complete": checkpoint_complete,
                 "eligible": eligible,
                 "reasons": completion_reasons,
@@ -376,6 +468,8 @@ class CheckpointExecutionMixin:
                 ],
                 "excluded_keys": [item["stable_key"] for item in exclusions],
                 "requires_release_approval": True,
+                "accepted_join_count": len(accepted_joins),
+                "excluded_count": len(exclusions),
             },
             "fingerprints": {
                 "catalog": preflight.catalog_fingerprint,
@@ -433,6 +527,20 @@ class CheckpointExecutionMixin:
                 "unselected_reads": 0,
                 "source_order": preflight.selected_keys,
             },
+            "report_contract": {
+                "current_outcome_key": "stable_key",
+                "attempt_history_is_separate": True,
+                "terminal_outcomes": sorted(_TERMINAL_OUTCOMES),
+                "exclusion_reason_required": True,
+                "accepted_join_requires": [
+                    "entry_id",
+                    "run_id",
+                    "run_fingerprint",
+                    "source_ref",
+                    "raw_content_hash",
+                    "canonical_content_hash",
+                ],
+            },
             "promotion": {
                 "candidate_created": False,
                 "pointer_changed": False,
@@ -446,11 +554,22 @@ class CheckpointExecutionMixin:
                     {item["stable_key"] for item in outcomes}
                 ),
                 "sum_outcome_counts": sum(outcome_counts.values()),
-                "attempt_count_separate": len(attempts),
+                "attempt_count_separate": self._transport_attempt_count(attempts),
+                "processed_count": len(outcomes),
+                "terminal_count": terminal_count,
+                "pending_count": pending_count,
+                "logical_attempt_count": len(attempts),
+                "transport_attempt_count": self._transport_attempt_count(attempts),
+                "accepted_join_count": len(accepted_joins),
+                "excluded_count": len(exclusions),
                 "partition_holds": (
                     len(preflight.selected)
                     == len({item["stable_key"] for item in outcomes})
                     == sum(outcome_counts.values())
+                    and set(preflight.selected_keys)
+                    == {item["stable_key"] for item in accepted_joins}.union(
+                        {item["stable_key"] for item in exclusions}
+                    )
                 ),
             },
         }

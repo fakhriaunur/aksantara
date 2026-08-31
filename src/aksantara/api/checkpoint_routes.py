@@ -289,6 +289,25 @@ def create_checkpoint_router() -> APIRouter:
             raise _error_response(exc) from exc
 
     @router.get(
+        "/runs/history",
+        summary="Read immutable checkpoint run history",
+        operation_id="checkpoint_run_history",
+        response_model=dict[str, Any],
+        description=(
+            "Read-only list of durable runs and report revisions under a "
+            "caller-owned root. Changed source fingerprints create a new "
+            "run and never rewrite a prior report."
+        ),
+    )
+    def run_history(
+        root: str = Query(..., description="Caller-owned checkpoint artifact root"),
+    ) -> dict[str, Any]:
+        try:
+            return CheckpointDriver(root=Path(root).expanduser().resolve()).history()
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+
+    @router.get(
         "/runs/{run_id}",
         summary="Read checkpoint status",
         operation_id="checkpoint_run_status",

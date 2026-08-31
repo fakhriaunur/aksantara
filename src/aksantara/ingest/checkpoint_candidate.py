@@ -7,7 +7,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from aksantara.domain.provenance import canonical_content_hash, content_hash_bytes
+from aksantara.domain.provenance import (
+    canonical_content_hash,
+    canonical_record_bytes,
+    canonical_record_payload,
+    content_hash_bytes,
+)
 from aksantara.ingest.checkpoint_storage import (
     _hash_payload,
     _read_json,
@@ -309,6 +314,34 @@ class CheckpointCandidateMixin:
         ):
             return False, "canonical_hash_mismatch", None
 
+        canonical_reference = item.get("canonical_reference")
+        if not isinstance(canonical_reference, str) or not canonical_reference:
+            return False, "canonical_join_missing", None
+        canonical_path = (self.root / canonical_reference).resolve()
+        try:
+            canonical_path.relative_to(self.root)
+            canonical_path.relative_to(run_dir)
+        except ValueError:
+            return False, "canonical_join_outside_run", None
+        try:
+            canonical_bytes = canonical_path.read_bytes()
+        except (OSError, ValueError):
+            return False, "canonical_join_missing", None
+        if content_hash_bytes(
+            canonical_bytes
+        ) != expected_hash or canonical_bytes != canonical_record_bytes(dict(entry)):
+            return False, "canonical_hash_mismatch", None
+        if not canonical_bytes.endswith(b"\n"):
+            return False, "canonical_serialization_mismatch", None
+        try:
+            canonical_payload = json.loads(canonical_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return False, "canonical_serialization_mismatch", None
+        if not isinstance(canonical_payload, Mapping):
+            return False, "canonical_serialization_mismatch", None
+        if dict(canonical_payload) != canonical_record_payload(dict(entry)):
+            return False, "canonical_serialization_mismatch", None
+
         raw_hash = str(item.get("raw_hash", ""))
         if len(raw_hash) != 64:
             return False, "raw_hash_missing", None
@@ -335,9 +368,12 @@ class CheckpointCandidateMixin:
                 "run_fingerprint": run_fingerprint,
                 "source_ref": dict(source_ref),
                 "raw_sha256": raw_hash,
+                "raw_content_hash": raw_hash,
                 "raw_snapshot_id": raw_snapshot_id,
                 "observation_id": item.get("observation_id"),
                 "canonical_content_hash": expected_hash,
+                "canonical_reference": canonical_reference,
+                "canonical_serialization": item.get("canonical_serialization"),
                 "review_id": item.get("conflict_id") or item.get("review_id"),
             },
         )

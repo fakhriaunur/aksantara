@@ -18,6 +18,11 @@ from aksantara.ingest.checkpoint_types import (
 )
 from aksantara.ingest.fallback import fetch_fallback
 from aksantara.ingest.official import fetch_official
+from aksantara.ingest.public_replay import (
+    KNOWN_RAW_HASHES,
+    ReplayError,
+    replay_snapshot,
+)
 from aksantara.ingest.rate_limit import (
     DEFAULT_RATE_LIMITER,
     FALLBACK_RATE_LIMITER,
@@ -41,6 +46,7 @@ __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "DEFAULT_RATE_LIMITER",
     "FALLBACK_RATE_LIMITER",
+    "KNOWN_RAW_HASHES",
     "OFFICIAL_RATE_LIMITER",
     "RAW_SNAPSHOT_SCHEMA_VERSION",
     "CatalogValidationError",
@@ -53,6 +59,7 @@ __all__ = [
     "LimitValidationError",
     "RateLimiter",
     "RawSnapshotStore",
+    "ReplayError",
     "RunResult",
     "TokenBucket",
     "calculate_backoff",
@@ -63,6 +70,7 @@ __all__ = [
     "load_raw",
     "local_cache_path",
     "normalize_stable_key",
+    "replay_snapshot",
     "save_raw",
     "selection_keys",
 ]
