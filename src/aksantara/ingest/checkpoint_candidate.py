@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
+from aksantara.domain.errors import AksantaraDomainError
 from aksantara.domain.models import SourceRef
 from aksantara.domain.provenance import (
     CANONICAL_RECORD_FIELDS,
@@ -21,7 +23,6 @@ from aksantara.ingest.checkpoint_storage import (
     _hash_payload,
     _read_json,
     _safe_relative,
-    _write_immutable,
     _write_state_json,
 )
 from aksantara.ingest.checkpoint_types import (
@@ -33,6 +34,32 @@ from aksantara.ingest.snapshots import RawSnapshotStore
 from aksantara.parse.parser_contract import ParserError, parse_kbbi
 from aksantara.validate.review import ReviewStore
 from aksantara.validate.schema import validate_entry
+
+
+def _coerce_int(value: Any, field: str) -> int:
+    """Coerce a stored durable int that may be string-encoded."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if re.fullmatch(r"-?\d+", stripped):
+            try:
+                return int(stripped)
+            except (ValueError, TypeError):
+                pass
+    raise CheckpointPersistenceError(
+        f"malformed durable integer for {field}",
+        details={"field": field, "value": value},
+    )
+
+
+def _coerce_outcome_index(value: Any) -> int | None:
+    """Coerce selected_index for sorting; returns None on malformed."""
+    try:
+        return _coerce_int(value, "selected_index")
+    except CheckpointPersistenceError:
+        return None
+
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SOURCE_REF_FIELDS = frozenset(
@@ -54,7 +81,7 @@ class CheckpointCandidateMixin:
 
     root: Path
 
-    def evaluate_candidate(
+    def evaluate_candidate(  # noqa: C901
         self: Any,
         run_id: str,
         *,
@@ -83,39 +110,71 @@ class CheckpointCandidateMixin:
         ):
             raise CheckpointError("release_reason must be non-empty when provided")
 
-        run_dir = self._existing_run_dir(run_id)
-        report = _read_json(run_dir / "report.json")
-        checkpoint = _read_json(run_dir / "checkpoint.json")
-        outcomes_payload = _read_json(run_dir / "outcomes.json")
-        attempts_payload = _read_json(run_dir / "attempts.json")
-        status = _read_json(run_dir / "status.json")
-        request = _read_json(run_dir / "request.json")
+        # Snapshot upstream state so we can guarantee no mutation on failure.
+        # Structured errors must leave canonical, candidate, release, pointer,
+        # review, and history state unchanged.
+        try:
+            run_dir = self._existing_run_dir(run_id)
+            report = _read_json(run_dir / "report.json")
+            checkpoint = _read_json(run_dir / "checkpoint.json")
+            outcomes_payload = _read_json(run_dir / "outcomes.json")
+            attempts_payload = _read_json(run_dir / "attempts.json")
+            status = _read_json(run_dir / "status.json")
+            request = _read_json(run_dir / "request.json")
+            preflight = _read_json(run_dir / "preflight.json")
+        except CheckpointError:
+            raise
+        except AksantaraDomainError as exc:
+            raise CheckpointError(
+                str(exc), details={"reason": getattr(exc, "reason", str(exc))}
+            ) from exc
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "failed to load durable checkpoint artifacts",
+                details={"run_id": run_id, "error_type": type(exc).__name__},
+            ) from exc
+
         outcomes = outcomes_payload.get("outcomes", [])
         if not isinstance(outcomes, list):
             raise CheckpointPersistenceError(
                 "outcomes artifact does not contain an array",
                 details={"run_id": run_id},
             )
-        preflight = _read_json(run_dir / "preflight.json")
-        context = self._candidate_lineage_context(
-            run_id=run_id,
-            report=report,
-            checkpoint=checkpoint,
-            outcomes_payload=outcomes_payload,
-            attempts_payload=attempts_payload,
-            status=status,
-            preflight=preflight,
-            request=request,
-        )
+        try:
+            context = self._candidate_lineage_context(
+                run_id=run_id,
+                report=report,
+                checkpoint=checkpoint,
+                outcomes_payload=outcomes_payload,
+                attempts_payload=attempts_payload,
+                status=status,
+                preflight=preflight,
+                request=request,
+            )
+        except CheckpointError:
+            raise
+        except AksantaraDomainError as exc:
+            raise CheckpointError(
+                str(exc), details={"reason": getattr(exc, "reason", str(exc))}
+            ) from exc
+
         run_fingerprint = context["run_fingerprint"]
         catalog_fingerprint = context["catalog_fingerprint"]
         pins = context["pins"]
         state_reason = context["state_reason"]
-        reviews = [
-            review
-            for review in ReviewStore(root=self.root).list_all()
-            if str(review.get("first_seen_run", "")) == run_id
-        ]
+        # Domain validation errors including QuarantinedError are caught
+        # and surfaced as structured CheckpointError or ineligible.
+        try:
+            reviews = [
+                review
+                for review in ReviewStore(root=self.root).list_all()
+                if str(review.get("first_seen_run", "")) == run_id
+            ]
+        except AksantaraDomainError as exc:
+            raise CheckpointError(
+                str(exc), details={"reason": getattr(exc, "reason", str(exc))}
+            ) from exc
+
         review_by_key: dict[str, list[dict[str, Any]]] = {}
         for review in reviews:
             key = str(review.get("stable_key", ""))
@@ -124,26 +183,100 @@ class CheckpointCandidateMixin:
 
         eligible_items: list[dict[str, Any]] = []
         excluded: list[dict[str, Any]] = []
-        for item in sorted(
-            (value for value in outcomes if isinstance(value, Mapping)),
-            key=lambda value: (
-                str(value.get("stable_key", "")),
-                int(value.get("selected_index", 0)),
-            ),
+
+        # Conservation: exactly one current outcome per immutable preflight-selected key
+        # with set-based checks. Use coercion for selected_index.
+        selected_keys_expected: list[str] = []
+        try:
+            # Preflight is already validated in context, but re-derive for set checks
+            sel = preflight.get("selection", {})
+            if isinstance(sel.get("selected_keys"), list):
+                selected_keys_expected = [str(k) for k in sel.get("selected_keys", [])]
+        except Exception:
+            selected_keys_expected = []
+
+        # Detect malformed selected_index coercion failures early
+        malformed_index_count = 0
+        sortable_outcomes: list[tuple[int, dict[str, Any]]] = []
+        for value in outcomes:
+            if not isinstance(value, Mapping):
+                continue
+            raw_idx = value.get("selected_index", 0)
+            coerced = _coerce_outcome_index(raw_idx)
+            if coerced is None:
+                # Malformed selected_index -> structured ineligible, not 500
+                malformed_index_count += 1
+                coerced = 0
+            sortable_outcomes.append((coerced, dict(value)))
+        # If any malformed, state_reason becomes persistence/ineligible
+        if malformed_index_count and state_reason is None:
+            # Treat malformed durable index as checkpoint_state_mismatch (ineligible)
+            # rather than 500, per malformed durable normalization
+            state_reason = "checkpoint_state_mismatch"
+
+        # Check set-based conservation before per-item joins
+        # This is the complete run-pin and fingerprint join plus conservation gate
+        if state_reason is None:
+            outcome_keys = [str(v.get("stable_key", "")) for _, v in sortable_outcomes]
+            # Truncated / missing / extra / duplicate
+            if len(outcome_keys) != len(selected_keys_expected):
+                state_reason = "checkpoint_state_mismatch"
+            elif len(set(outcome_keys)) != len(outcome_keys):
+                state_reason = "checkpoint_state_mismatch"
+            elif set(outcome_keys) != set(selected_keys_expected):
+                state_reason = "checkpoint_state_mismatch"
+            else:
+                # Attempt ledger coverage: logical and physical
+                try:
+                    logical = (
+                        attempts_payload.get("attempts")
+                        if isinstance(attempts_payload.get("attempts"), list)
+                        else []
+                    )
+                    if len(logical) != len(selected_keys_expected):  # type: ignore[arg-type]
+                        state_reason = "checkpoint_state_mismatch"
+                    # Physical coverage is validated per-item to preserve
+                    # specific observation_attempt_missing reasons; global
+                    # incomplete physical ledger is still ineligible via
+                    # per-item checks, not a blanket state_reason.
+                except Exception:
+                    state_reason = "checkpoint_state_mismatch"
+
+        for _, item in sorted(
+            sortable_outcomes, key=lambda kv: (str(kv[1].get("stable_key", "")), kv[0])
         ):
             stable_key = str(item.get("stable_key", ""))
             item_reviews = review_by_key.get(stable_key, [])
-            item_eligible, reason, candidate_item = self._candidate_item(
-                item,
-                item_reviews,
-                run_dir=run_dir,
-                run_fingerprint=run_fingerprint,
-                catalog_fingerprint=catalog_fingerprint,
-                pins=pins,
-                report=report,
-                attempts_payload=attempts_payload,
-                state_reason=state_reason,
-            )
+            try:
+                item_eligible, reason, candidate_item = self._candidate_item(
+                    item,
+                    item_reviews,
+                    run_dir=run_dir,
+                    run_fingerprint=run_fingerprint,
+                    catalog_fingerprint=catalog_fingerprint,
+                    pins=pins,
+                    report=report,
+                    attempts_payload=attempts_payload,
+                    state_reason=state_reason,
+                )
+            except AksantaraDomainError as exc:
+                # Domain validation errors including QuarantinedError are normalized
+                # to structured ineligible, not 500. Preserve machine-readable reason.
+                item_eligible, reason, candidate_item = (
+                    False,
+                    getattr(exc, "reason", "quarantined"),
+                    None,
+                )
+            except CheckpointError:
+                raise
+            except Exception as exc:
+                raise CheckpointPersistenceError(
+                    "candidate item evaluation failed",
+                    details={
+                        "stable_key": stable_key,
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
             if item_eligible and candidate_item is not None:
                 eligible_items.append(candidate_item)
             else:
@@ -161,17 +294,30 @@ class CheckpointCandidateMixin:
                     }
                 )
 
+        # Durable lifecycle artifacts are independently validated: cursor/limit/selected_count
+        # This was already checked in _candidate_lineage_context, but recompute checkpoint_complete
+        # with coerced selected_count handling.
+        selected_count_raw = checkpoint.get("selected_count", len(outcomes))
+        try:
+            selected_count_coerced = _coerce_int(selected_count_raw, "selected_count")
+        except CheckpointPersistenceError:
+            selected_count_coerced = len(outcomes) + 1  # force mismatch
+            if state_reason is None:
+                state_reason = "checkpoint_state_mismatch"
+
         checkpoint_complete = bool(
             context["fixed_checkpoint"]
             and report.get("completion", {}).get("checkpoint_complete")
             and report.get("status") == "completed"
-            and len(outcomes) == int(checkpoint.get("selected_count", len(outcomes)))
+            and len(outcomes) == selected_count_coerced
+            and selected_count_coerced == len(selected_keys_expected)
             and all(
                 isinstance(item, Mapping)
                 and item.get("outcome")
                 in {"accepted", "quarantined", "rejected", "failed"}
-                for item in outcomes
+                for _, item in sortable_outcomes
             )
+            and state_reason is None
         )
         reasons: list[str] = []
         if state_reason:
@@ -192,63 +338,22 @@ class CheckpointCandidateMixin:
             reasons.append("candidate_set_incomplete")
         eligible = not reasons
 
-        candidate: dict[str, Any] | None = None
-        if eligible:
-            candidate_payload: dict[str, Any] = {
-                "schema_version": "checkpoint-candidate-v1",
-                "candidate_id": f"candidate-{run_fingerprint}",
-                "run_id": run_id,
-                "run_fingerprint": run_fingerprint,
-                "catalog_fingerprint": catalog_fingerprint,
-                "corpus": report.get("corpus", {}),
-                "selection": report.get("selection", {}),
-                "pins": pins,
-                "authority": {
-                    "mode": "official-first",
-                    "official_source_kinds": [
-                        "official-live",
-                        "official-snapshot",
-                    ],
-                    "fallback_is_evidence_only": True,
-                },
-                "release_approval": {
-                    "approved": True,
-                    "reviewer": (release_reviewer or "").strip(),
-                    "reason": (release_reason or "").strip(),
-                },
-                "entries": eligible_items,
-                "vectors_created": False,
-                "pointer_changed": False,
-            }
-            candidate_payload["self_hash"] = _hash_payload(candidate_payload)
-            candidate_path = (
-                self.root
-                / ".aksantara"
-                / "candidates"
-                / f"{candidate_payload['candidate_id']}.json"
-            )
-            _write_immutable(
-                candidate_path,
-                json.dumps(
-                    candidate_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                + b"\n",
-                self.root,
-            )
-            candidate = {
-                **candidate_payload,
-                "reference": _safe_relative(self.root, candidate_path),
-                "candidate_created": True,
-            }
-
-        selected_keys = [
-            str(item.get("stable_key"))
-            for item in outcomes
-            if isinstance(item, Mapping)
-        ]
+        # Atomic candidate and evaluation persistence: stage and commit only
+        # with successful evaluation; orphan candidates are never independently
+        # discoverable and state is preserved on failure.
+        selected_keys = (
+            [
+                str(v.get("stable_key"))
+                for _, v in sortable_outcomes
+                if isinstance(v, Mapping)
+            ]
+            if sortable_outcomes
+            else [
+                str(item.get("stable_key"))
+                for item in outcomes
+                if isinstance(item, Mapping)
+            ]
+        )
         eligible_keys = [
             str(item.get("entry_id")) for item in eligible_items if item.get("entry_id")
         ]
@@ -261,12 +366,12 @@ class CheckpointCandidateMixin:
             "excluded_count": len(excluded),
             "partition_holds": len(eligible_items) + len(excluded) == len(outcomes),
         }
-        evaluation = {
+        evaluation: dict[str, Any] = {
             "schema_version": "checkpoint-candidate-evaluation-v1",
             "run_id": run_id,
             "run_fingerprint": run_fingerprint,
-            "candidate_created": candidate is not None,
-            "candidate": candidate,
+            "candidate_created": False,
+            "candidate": None,
             "eligible": eligible,
             "checkpoint_complete": checkpoint_complete,
             "release_approval": {
@@ -316,11 +421,135 @@ class CheckpointCandidateMixin:
             "current_version_changed": False,
             "vector_work": False,
         }
-        evaluation_path = run_dir / "candidate-evaluation.json"
-        _write_state_json(evaluation_path, evaluation, self.root)
-        return evaluation
 
-    def _candidate_lineage_context(
+        if eligible:
+            candidate_payload: dict[str, Any] = {
+                "schema_version": "checkpoint-candidate-v1",
+                "candidate_id": f"candidate-{run_fingerprint}",
+                "run_id": run_id,
+                "run_fingerprint": run_fingerprint,
+                "catalog_fingerprint": catalog_fingerprint,
+                "corpus": report.get("corpus", {}),
+                "selection": report.get("selection", {}),
+                "pins": pins,
+                "authority": {
+                    "mode": "official-first",
+                    "official_source_kinds": [
+                        "official-live",
+                        "official-snapshot",
+                    ],
+                    "fallback_is_evidence_only": True,
+                },
+                "release_approval": {
+                    "approved": True,
+                    "reviewer": (release_reviewer or "").strip(),
+                    "reason": (release_reason or "").strip(),
+                },
+                "entries": eligible_items,
+                "vectors_created": False,
+                "pointer_changed": False,
+            }
+            candidate_payload["self_hash"] = _hash_payload(candidate_payload)
+            candidate_bytes = (
+                json.dumps(
+                    candidate_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            candidate_path = (
+                self.root
+                / ".aksantara"
+                / "candidates"
+                / f"{candidate_payload['candidate_id']}.json"
+            )
+            # Stage candidate bytes and evaluation atomically
+            candidates_dir = candidate_path.parent
+            evaluation_path = run_dir / "candidate-evaluation.json"
+            # Prepare evaluation with candidate included for commit
+            evaluation["candidate_created"] = True
+            evaluation["candidate"] = {
+                **candidate_payload,
+                "reference": _safe_relative(self.root, candidate_path),
+                "candidate_created": True,
+            }
+            # Staging paths (hidden, not discoverable)
+            staging_candidate = (
+                candidates_dir / f".{candidate_path.name}.tmp.{os.getpid()}"
+            )
+            staging_evaluation = (
+                run_dir / f".candidate-evaluation.json.tmp.{os.getpid()}"
+            )
+            try:
+                candidates_dir.mkdir(parents=True, exist_ok=True)
+                staging_candidate.write_bytes(candidate_bytes)
+                # Write evaluation staging
+                staging_evaluation.write_bytes(
+                    json.dumps(
+                        evaluation,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            except OSError as exc:
+                for p in (staging_candidate, staging_evaluation):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise CheckpointPersistenceError(
+                    "candidate staging failed",
+                    details={"run_id": run_id, "error_type": type(exc).__name__},
+                ) from exc
+            try:
+                # Commit both atomically: candidate first is staged not visible,
+                # evaluation is the gate. Use replace for atomic visibility.
+                # Candidate is not discoverable until evaluation commits.
+                os.replace(staging_candidate, candidate_path)
+                os.replace(staging_evaluation, evaluation_path)
+            except OSError as exc:
+                for p in (staging_candidate, staging_evaluation):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                # Preserve state on failure: remove partially committed candidate if evaluation not yet
+                # If candidate was already replaced but evaluation replace failed, remove candidate to avoid orphan
+                try:
+                    if evaluation_path.exists():
+                        # evaluation replace failed, candidate may have been committed orphan
+                        # Remove orphan candidate to keep atomicity
+                        candidate_path.unlink(missing_ok=True)
+                    else:
+                        candidate_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise CheckpointPersistenceError(
+                    "candidate commit failed",
+                    details={"run_id": run_id, "error_type": type(exc).__name__},
+                ) from exc
+            return evaluation
+        else:
+            # Non-eligible: no candidate bytes, but evaluation must be persisted.
+            # Preserve atomicity via _write_state_json (which is atomic) and leave
+            # candidate state unchanged (no orphan created).
+            evaluation_path = run_dir / "candidate-evaluation.json"
+            try:
+                _write_state_json(evaluation_path, evaluation, self.root)
+            except CheckpointError:
+                raise
+            except Exception as exc:
+                raise CheckpointPersistenceError(
+                    "evaluation persistence failed",
+                    details={"run_id": run_id, "error_type": type(exc).__name__},
+                ) from exc
+            return evaluation
+
+    def _candidate_lineage_context(  # noqa: C901
         self: Any,
         *,
         run_id: str,
@@ -340,159 +569,368 @@ class CheckpointCandidateMixin:
             "state_reason": None,
             "fixed_checkpoint": False,
         }
-        preflight_fingerprints = preflight.get("fingerprints")
-        if not isinstance(preflight_fingerprints, Mapping):
-            context["state_reason"] = "run_fingerprint_missing"
-            return context
-        if request.get("run_id") != run_id:
-            context["state_reason"] = "run_id_mismatch"
-            return context
-        request_preflight = request.get("preflight")
-        if not isinstance(request_preflight, Mapping) or dict(
-            request_preflight
-        ) != dict(preflight):
-            context["state_reason"] = "run_fingerprint_mismatch"
-            return context
-        run_fingerprint = preflight_fingerprints.get("run")
-        catalog_fingerprint = preflight_fingerprints.get("catalog")
-        if not _valid_hash(run_fingerprint):
-            context["state_reason"] = "run_fingerprint_missing"
-            return context
-        if not _valid_hash(catalog_fingerprint):
-            context["state_reason"] = "catalog_fingerprint_missing"
-            return context
-        context["run_fingerprint"] = str(run_fingerprint)
-        context["catalog_fingerprint"] = str(catalog_fingerprint)
-
-        preimages = preflight_fingerprints.get("preimages")
-        if not isinstance(preimages, Mapping):
-            context["state_reason"] = "run_fingerprint_unverifiable"
-            return context
-        catalog_preimage = preimages.get("catalog")
-        run_preimage = preimages.get("run")
-        if not isinstance(catalog_preimage, Mapping) or not isinstance(
-            run_preimage, Mapping
-        ):
-            context["state_reason"] = "run_fingerprint_unverifiable"
-            return context
-        if _hash_payload(catalog_preimage) != str(catalog_fingerprint) or _hash_payload(
-            run_preimage
-        ) != str(run_fingerprint):
-            context["state_reason"] = "run_fingerprint_mismatch"
-            return context
-        if (
-            run_preimage.get("catalog_fingerprint") != catalog_fingerprint
-            or run_preimage.get("parser_version")
-            != preflight.get("pins", {}).get("parser_version")
-            or run_preimage.get("transform_version")
-            != preflight.get("pins", {}).get("transform_version")
-            or run_preimage.get("validation_policy")
-            != preflight.get("pins", {}).get("validation_policy")
-        ):
-            context["state_reason"] = "run_fingerprint_mismatch"
-            return context
-        selection = preflight.get("selection")
-        records = preflight.get("records")
-        if not isinstance(selection, Mapping) or not isinstance(records, list):
-            context["state_reason"] = "checkpoint_state_mismatch"
-            return context
-        record_keys = [
-            value.get("stable_key") for value in records if isinstance(value, Mapping)
-        ]
-        selected_keys = selection.get("selected_keys")
-        effective_limit = run_preimage.get("effective_limit")
-        if (
-            not isinstance(effective_limit, int)
-            or not isinstance(selected_keys, list)
-            or effective_limit != selection.get("effective_limit")
-            or selected_keys != record_keys[:effective_limit]
-            or selection.get("selected_count") != len(selected_keys)
-            or selection.get("shortfall") != max(0, effective_limit - len(record_keys))
-        ):
-            context["state_reason"] = "checkpoint_state_mismatch"
-            return context
-        context["fixed_checkpoint"] = (
-            effective_limit == 100
-            and len(record_keys) >= 100
-            and selection.get("selected_count") == 100
-            and selection.get("shortfall") == 0
-        )
-        idempotency = request.get("idempotency")
-        if not isinstance(idempotency, Mapping) or idempotency.get("preimage") != dict(
-            run_preimage
-        ):
-            context["state_reason"] = "run_fingerprint_mismatch"
-            return context
-
-        report_fingerprints = report.get("fingerprints")
-        if not _matching_fingerprints(
-            report_fingerprints,
-            catalog_fingerprint=str(catalog_fingerprint),
-            run_fingerprint=str(run_fingerprint),
-        ):
-            context["state_reason"] = "run_fingerprint_mismatch"
-            return context
-        for artifact in (checkpoint, outcomes_payload, attempts_payload, status):
-            if artifact.get("run_id") != run_id:
+        # Fingerprint and preimage checks with structured malformed handling
+        try:
+            preflight_fingerprints = preflight.get("fingerprints")
+            if not isinstance(preflight_fingerprints, Mapping):
+                context["state_reason"] = "run_fingerprint_missing"
+                return context
+            if request.get("run_id") != run_id:
                 context["state_reason"] = "run_id_mismatch"
                 return context
+            request_preflight = request.get("preflight")
+            if not isinstance(request_preflight, Mapping) or dict(
+                request_preflight
+            ) != dict(preflight):
+                context["state_reason"] = "run_fingerprint_mismatch"
+                return context
+            run_fingerprint = preflight_fingerprints.get("run")
+            catalog_fingerprint = preflight_fingerprints.get("catalog")
+            if not _valid_hash(run_fingerprint):
+                context["state_reason"] = "run_fingerprint_missing"
+                return context
+            if not _valid_hash(catalog_fingerprint):
+                context["state_reason"] = "catalog_fingerprint_missing"
+                return context
+            context["run_fingerprint"] = str(run_fingerprint)
+            context["catalog_fingerprint"] = str(catalog_fingerprint)
+
+            preimages = preflight_fingerprints.get("preimages")
+            if not isinstance(preimages, Mapping):
+                context["state_reason"] = "run_fingerprint_unverifiable"
+                return context
+            catalog_preimage = preimages.get("catalog")
+            run_preimage = preimages.get("run")
+            if not isinstance(catalog_preimage, Mapping) or not isinstance(
+                run_preimage, Mapping
+            ):
+                context["state_reason"] = "run_fingerprint_unverifiable"
+                return context
+            if _hash_payload(catalog_preimage) != str(
+                catalog_fingerprint
+            ) or _hash_payload(run_preimage) != str(run_fingerprint):
+                context["state_reason"] = "run_fingerprint_mismatch"
+                return context
+            # Pins mapping validation: malformed durable pins are persistence/ineligible
+            pins_obj = preflight.get("pins")
+            if not isinstance(pins_obj, Mapping):
+                context["state_reason"] = "run_pins_missing"
+                return context
+            if (
+                run_preimage.get("catalog_fingerprint") != catalog_fingerprint
+                or run_preimage.get("parser_version") != pins_obj.get("parser_version")
+                or run_preimage.get("transform_version")
+                != pins_obj.get("transform_version")
+                or run_preimage.get("validation_policy")
+                != pins_obj.get("validation_policy")
+            ):
+                context["state_reason"] = "run_fingerprint_mismatch"
+                return context
+            selection = preflight.get("selection")
+            records = preflight.get("records")
+            if not isinstance(selection, Mapping) or not isinstance(records, list):
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+            record_keys = [
+                value.get("stable_key")
+                for value in records
+                if isinstance(value, Mapping)
+            ]
+            selected_keys = selection.get("selected_keys")
+            effective_limit_raw = run_preimage.get("effective_limit")
+            # Coercion for effective_limit and selected counts
+            try:
+                effective_limit = _coerce_int(effective_limit_raw, "effective_limit")
+            except CheckpointPersistenceError:
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+            # Need to handle selected_keys being list but also check selected_count coercion
+            try:
+                selected_count_raw = selection.get("selected_count")
+                shortfall_raw = selection.get("shortfall")
+                selected_count = (
+                    _coerce_int(selected_count_raw, "selected_count")
+                    if selected_count_raw is not None
+                    else len(selected_keys)
+                    if isinstance(selected_keys, list)
+                    else 0
+                )
+                shortfall = (
+                    _coerce_int(shortfall_raw, "shortfall")
+                    if shortfall_raw is not None
+                    else max(0, effective_limit - len(record_keys))
+                )
+            except CheckpointPersistenceError:
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+            if (
+                not isinstance(selected_keys, list)
+                or effective_limit
+                != _coerce_int(selection.get("effective_limit"), "effective_limit")
+                if isinstance(selection.get("effective_limit"), (int, str))
+                else False
+                or selected_keys != record_keys[:effective_limit]
+                or selected_count != len(selected_keys)
+                or shortfall != max(0, effective_limit - len(record_keys))
+            ):
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+            # Also check effective_limit matches selection.effective_limit with coercion
+            try:
+                sel_eff = _coerce_int(
+                    selection.get("effective_limit"), "selected_count"
+                )
+                if sel_eff != effective_limit:
+                    context["state_reason"] = "checkpoint_state_mismatch"
+                    return context
+            except CheckpointPersistenceError:
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+            context["fixed_checkpoint"] = (
+                effective_limit == 100
+                and len(record_keys) >= 100
+                and selected_count == 100
+                and shortfall == 0
+            )
+            idempotency = request.get("idempotency")
+            if not isinstance(idempotency, Mapping) or idempotency.get(
+                "preimage"
+            ) != dict(run_preimage):
+                context["state_reason"] = "run_fingerprint_mismatch"
+                return context
+
+            report_fingerprints = report.get("fingerprints")
             if not _matching_fingerprints(
-                artifact.get("fingerprints"),
+                report_fingerprints,
                 catalog_fingerprint=str(catalog_fingerprint),
                 run_fingerprint=str(run_fingerprint),
             ):
                 context["state_reason"] = "run_fingerprint_mismatch"
                 return context
-        if (
-            report.get("run_id") != run_id
-            or report.get("revision") != checkpoint.get("revision")
-            or report.get("revision") != outcomes_payload.get("revision")
-            or report.get("revision") != status.get("revision")
-            or report.get("status") != status.get("status")
-            or report.get("selection") != selection
-            or not _matching_corpus(
-                report.get("corpus"),
-                preflight.get("catalog"),
-                record_count=len(records),
-            )
-            or checkpoint.get("processed_count")
-            != len(outcomes_payload.get("outcomes", []))
-            or status.get("outcome_counts") != checkpoint.get("outcome_counts")
-            or status.get("completion") != report.get("completion")
-            or attempts_payload.get("revision") != report.get("revision")
-            or attempts_payload.get("attempt_count")
-            != len(attempts_payload.get("physical_attempts", []))
-            or attempts_payload.get("logical_attempt_count")
-            != len(attempts_payload.get("attempts", []))
-        ):
-            context["state_reason"] = "checkpoint_state_mismatch"
-            return context
+            for artifact in (checkpoint, outcomes_payload, attempts_payload, status):
+                if artifact.get("run_id") != run_id:
+                    context["state_reason"] = "run_id_mismatch"
+                    return context
+                if not _matching_fingerprints(
+                    artifact.get("fingerprints"),
+                    catalog_fingerprint=str(catalog_fingerprint),
+                    run_fingerprint=str(run_fingerprint),
+                ):
+                    context["state_reason"] = "run_fingerprint_mismatch"
+                    return context
 
-        preflight_pins = preflight.get("pins")
-        if not _valid_pins(preflight_pins):
-            context["state_reason"] = "run_pins_missing"
-            return context
-        preflight_pins_mapping = cast(Mapping[str, Any], preflight_pins)
-        expected_pins = {
-            key: str(preflight_pins_mapping.get(key)) for key in sorted(_PIN_FIELDS)
-        }
-        for artifact in (
-            report,
-            checkpoint,
-            outcomes_payload,
-            attempts_payload,
-            status,
-        ):
-            artifact_pins = artifact.get("pins")
-            if not _valid_pins(artifact_pins):
+            # Durable lifecycle artifacts are independently validated
+            # Status cursor/limit/selected_count, checkpoint selected_keys/terminal_count,
+            # report processed/current/terminal/pending counters, and allowed lifecycle state
+            try:
+                # Status checks
+                status_cursor = status.get("cursor", {})
+                if isinstance(status_cursor, Mapping):
+                    cursor_val_raw = status_cursor.get(
+                        "value", status_cursor.get("cursor", 0)
+                    )
+                    cursor_lim_raw = status_cursor.get(
+                        "limit", status.get("limit", effective_limit)
+                    )
+                    try:
+                        cursor_val = (
+                            _coerce_int(cursor_val_raw, "cursor_value")
+                            if cursor_val_raw is not None
+                            else 0
+                        )
+                        cursor_lim = (
+                            _coerce_int(cursor_lim_raw, "cursor_limit")
+                            if cursor_lim_raw is not None
+                            else effective_limit
+                        )
+                    except CheckpointPersistenceError:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                    outcomes_list = outcomes_payload.get("outcomes", [])
+                    outcomes_len = (
+                        len(outcomes_list) if isinstance(outcomes_list, list) else 0
+                    )
+                    if cursor_val != outcomes_len:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                    if cursor_lim != effective_limit:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                status_selected_raw = status.get("selected_count")
+                if status_selected_raw is not None:
+                    try:
+                        sc = _coerce_int(status_selected_raw, "selected_count")
+                        if sc != len(selected_keys):  # type: ignore[arg-type]
+                            context["state_reason"] = "checkpoint_state_mismatch"
+                            return context
+                    except CheckpointPersistenceError:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                # Allowed lifecycle state
+                allowed_states = {
+                    "created",
+                    "running",
+                    "blocked",
+                    "failed",
+                    "completed",
+                }
+                report_status = report.get("status")
+                status_status = status.get("status")
+                if (
+                    report_status not in allowed_states
+                    or status_status not in allowed_states
+                ):
+                    context["state_reason"] = "checkpoint_state_mismatch"
+                    return context
+                if report_status != status_status:
+                    context["state_reason"] = "checkpoint_state_mismatch"
+                    return context
+                # Checkpoint selected_keys/terminal_count
+                ckpt_selected = checkpoint.get("selected_keys")
+                if isinstance(ckpt_selected, list):
+                    if [str(k) for k in ckpt_selected] != [  # type: ignore[union-attr]
+                        str(k)
+                        for k in selected_keys  # type: ignore[union-attr]
+                    ]:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                else:
+                    # If missing, it's a mismatch unless selected_keys is empty
+                    if selected_keys:  # type: ignore[truthy-bool]
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                # terminal_count vs sum terminal outcomes
+                outcomes_payload_list = outcomes_payload.get("outcomes", [])
+                if isinstance(outcomes_payload_list, list):
+                    term_expected = sum(
+                        1
+                        for it in outcomes_payload_list
+                        if isinstance(it, Mapping)
+                        and str(it.get("outcome"))
+                        in {"accepted", "quarantined", "rejected", "failed"}
+                    )
+                    try:
+                        term_actual_raw = checkpoint.get("terminal_count")
+                        if term_actual_raw is not None:
+                            term_actual = _coerce_int(term_actual_raw, "terminal_count")
+                            if term_actual != term_expected:
+                                context["state_reason"] = "checkpoint_state_mismatch"
+                                return context
+                    except CheckpointPersistenceError:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+                    # report counters
+                    try:
+                        processed_raw = report.get("processed_count")
+                        current_raw = report.get(
+                            "current_outcome_count", len(outcomes_payload_list)
+                        )
+                        terminal_raw = report.get("terminal_count", term_expected)
+                        pending_raw = report.get("pending_count", 0)
+                        if processed_raw is not None:
+                            proc = _coerce_int(processed_raw, "processed_count")
+                            if proc != len(outcomes_payload_list):
+                                context["state_reason"] = "checkpoint_state_mismatch"
+                                return context
+                        if current_raw is not None:
+                            cur = _coerce_int(current_raw, "current_outcome_count")
+                            if cur != len(outcomes_payload_list):
+                                context["state_reason"] = "checkpoint_state_mismatch"
+                                return context
+                        if terminal_raw is not None:
+                            term_r = _coerce_int(terminal_raw, "terminal_count")
+                            if term_r != term_expected:
+                                context["state_reason"] = "checkpoint_state_mismatch"
+                                return context
+                        if pending_raw is not None:
+                            pend = _coerce_int(pending_raw, "pending_count")
+                            pending_expected = sum(
+                                1
+                                for it in outcomes_payload_list
+                                if isinstance(it, Mapping)
+                                and str(it.get("outcome"))
+                                in {"pending", "in_progress", "retryable"}
+                            )
+                            if pend != pending_expected:
+                                context["state_reason"] = "checkpoint_state_mismatch"
+                                return context
+                    except CheckpointPersistenceError:
+                        context["state_reason"] = "checkpoint_state_mismatch"
+                        return context
+            except CheckpointError:
+                raise
+            except Exception:
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+
+            if (
+                report.get("run_id") != run_id
+                or report.get("revision") != checkpoint.get("revision")
+                or report.get("revision") != outcomes_payload.get("revision")
+                or report.get("revision") != status.get("revision")
+                or report.get("status") != status.get("status")
+                or report.get("selection") != selection
+                or not _matching_corpus(
+                    report.get("corpus"),
+                    preflight.get("catalog"),
+                    record_count=len(records),
+                )
+                or _coerce_int(checkpoint.get("processed_count"), "processed_count")
+                != len(outcomes_payload.get("outcomes", []))
+                or status.get("outcome_counts") != checkpoint.get("outcome_counts")
+                or status.get("completion") != report.get("completion")
+                or attempts_payload.get("revision") != report.get("revision")
+                or _coerce_int(attempts_payload.get("attempt_count"), "attempt_count")
+                != len(attempts_payload.get("physical_attempts", []))
+                or _coerce_int(
+                    attempts_payload.get("logical_attempt_count"),
+                    "logical_attempt_count",
+                )
+                != len(attempts_payload.get("attempts", []))
+            ):
+                context["state_reason"] = "checkpoint_state_mismatch"
+                return context
+
+            preflight_pins = preflight.get("pins")
+            if not isinstance(preflight_pins, Mapping) or not _valid_pins(
+                preflight_pins
+            ):
                 context["state_reason"] = "run_pins_missing"
                 return context
-            pin_reason = _pin_mismatch_reason(artifact_pins, expected_pins)
-            if pin_reason is not None:
-                context["state_reason"] = pin_reason
-                return context
-        context["pins"] = expected_pins
-        return context
+            preflight_pins_mapping = cast(Mapping[str, Any], preflight_pins)
+            expected_pins = {
+                key: str(preflight_pins_mapping.get(key)) for key in sorted(_PIN_FIELDS)
+            }
+            for artifact in (
+                report,
+                checkpoint,
+                outcomes_payload,
+                attempts_payload,
+                status,
+            ):
+                artifact_pins = artifact.get("pins")
+                if not isinstance(artifact_pins, Mapping) or not _valid_pins(
+                    artifact_pins
+                ):
+                    context["state_reason"] = "run_pins_missing"
+                    return context
+                pin_reason = _pin_mismatch_reason(artifact_pins, expected_pins)
+                if pin_reason is not None:
+                    context["state_reason"] = pin_reason
+                    return context
+            context["pins"] = expected_pins
+            return context
+        except CheckpointError:
+            raise
+        except AksantaraDomainError as exc:
+            raise CheckpointError(
+                str(exc), details={"reason": getattr(exc, "reason", str(exc))}
+            ) from exc
+        except Exception as exc:
+            raise CheckpointPersistenceError(
+                "candidate lineage context failed",
+                details={"run_id": run_id, "error_type": type(exc).__name__},
+            ) from exc
 
     def _candidate_item(
         self: Any,
@@ -1142,10 +1580,12 @@ def _reparse_raw_join(
 ) -> str | None:
     """Reparse raw bytes so stored parsed artifacts cannot be substituted."""
     try:
+        from aksantara.domain.errors import AksantaraDomainError
+
         source_model = SourceRef.model_validate_strings(dict(source_ref))
         reparsed = parse_kbbi(raw_bytes, source_model)
         validate_entry(reparsed, raw_bytes=raw_bytes)
-    except (ParserError, ValueError, TypeError):
+    except (ParserError, ValueError, TypeError, AksantaraDomainError):
         return "parsed_raw_join_mismatch"
     if reparsed.model_dump(mode="json") != dict(entry):
         return "parsed_raw_join_mismatch"

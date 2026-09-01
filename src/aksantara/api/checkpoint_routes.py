@@ -17,6 +17,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from aksantara.domain.errors import AksantaraDomainError
 from aksantara.ingest.checkpoint import (
     CatalogValidationError,
     CheckpointDriver,
@@ -491,6 +492,23 @@ def create_checkpoint_router() -> APIRouter:
             )
         except CheckpointError as exc:
             raise _error_response(exc) from exc
+        except AksantaraDomainError as exc:
+            # Domain validation errors including QuarantinedError are normalized
+            # to typed CheckpointError without traceback or 500.
+            mapped = CheckpointError(
+                str(exc),
+                details={
+                    "reason": getattr(exc, "reason", str(exc)),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise _error_response(mapped) from exc
+        except Exception as exc:
+            mapped = CheckpointError(
+                "candidate evaluation failed",
+                details={"error_type": type(exc).__name__},
+            )
+            raise _error_response(mapped) from exc
 
     @router.get(
         "/runs/{run_id}/candidate",
@@ -508,5 +526,20 @@ def create_checkpoint_router() -> APIRouter:
             ).candidate_evaluation(run_id)
         except CheckpointError as exc:
             raise _error_response(exc) from exc
+        except AksantaraDomainError as exc:
+            mapped = CheckpointError(
+                str(exc),
+                details={
+                    "reason": getattr(exc, "reason", str(exc)),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            raise _error_response(mapped) from exc
+        except Exception as exc:
+            mapped = CheckpointError(
+                "candidate read failed",
+                details={"error_type": type(exc).__name__},
+            )
+            raise _error_response(mapped) from exc
 
     return router
