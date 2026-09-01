@@ -131,6 +131,10 @@ def _parse_args() -> argparse.Namespace:
         help="Fixed ISO-8601 clock for deterministic output (e.g. 2026-09-01T00:00:00Z)",
     )
     gen.add_argument("--created-at", help="Alias for --fixed-clock")
+    gen.add_argument(
+        "--fault",
+        help="Local fault seam for atomic publication tests: artifact_write|output_hash|manifest_commit|verification (caller-owned, process-scoped, does not delete retained evidence)",
+    )
     gen.add_argument("--json", action="store_true", help="Machine-readable JSON output")
 
     # verify
@@ -240,6 +244,7 @@ def main(argv: list[str] | None = None) -> int:
                     schema_version=getattr(args, "schema_version", None),
                     created_at=clock,
                     fixed_clock=clock,
+                    fault=getattr(args, "fault", None),
                 )
                 _emit(manifest)
                 return 0

@@ -26,13 +26,19 @@ from aksantara.projections.schemas import (
     WORD_SCHEMA_V1,
 )
 from aksantara.projections.store import (
+    VALID_STATUSES,
     ProjectionError,
+    cleanup_projection_staging,
+    clear_projection_faults,
     generate_projection,
+    get_projection_status,
     list_projections,
     projection_manifest_path,
     projection_output_path,
     read_projection_artifact,
     read_projection_manifest,
+    set_projection_fault,
+    snapshot_upstream_hashes,
 )
 
 __all__ = [
@@ -42,6 +48,7 @@ __all__ = [
     "REJECTED_PRODUCT_IDENTIFIERS",
     "RELATIONS_SCHEMA_V1",
     "SCHEMA_VERSIONS",
+    "VALID_STATUSES",
     "WORD_SCHEMA_V1",
     "ProjectionError",
     "artifact_bytes",
@@ -51,7 +58,10 @@ __all__ = [
     "build_projection_manifest",
     "build_relations_artifact",
     "build_word_artifact",
+    "cleanup_projection_staging",
+    "clear_projection_faults",
     "generate_projection",
+    "get_projection_status",
     "list_projections",
     "manifest_self_hash",
     "projection_identity",
@@ -60,4 +70,6 @@ __all__ = [
     "read_projection_artifact",
     "read_projection_manifest",
     "registry_snapshot",
+    "set_projection_fault",
+    "snapshot_upstream_hashes",
 ]

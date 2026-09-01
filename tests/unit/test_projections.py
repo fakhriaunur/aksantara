@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from aksantara.domain.models import KBBIEntry, SourceRef
-from aksantara.embeddings.release import seed_release, verify_release
+from aksantara.embeddings.release import seed_release
 from aksantara.projections.generator import (
     artifact_bytes,
     artifact_hash,
@@ -19,15 +19,12 @@ from aksantara.projections.generator import (
     build_word_artifact,
 )
 from aksantara.projections.manifest import (
-    build_projection_manifest,
     manifest_self_hash,
     projection_identity,
 )
 from aksantara.projections.registry import (
-    ALLOWED_CONSUMERS,
     ALLOWED_TRACKS,
     GENERATOR_VERSION,
-    REJECTED_PRODUCT_IDENTIFIERS,
     SCHEMA_VERSIONS,
     is_rejected_product,
     registry_snapshot,
@@ -42,9 +39,7 @@ from aksantara.projections.schemas import (
 from aksantara.projections.store import (
     ProjectionError,
     generate_projection,
-    list_projections,
     read_projection_artifact,
-    read_projection_manifest,
 )
 
 
@@ -74,7 +69,9 @@ def _make_entry(
     )
 
 
-def _seed_release_with_canonical(tmpdir: Path, version: str, entries: list[KBBIEntry]) -> None:
+def _seed_release_with_canonical(
+    tmpdir: Path, version: str, entries: list[KBBIEntry]
+) -> None:
     seed_release(tmpdir, version, entries)
     canonical_dir = tmpdir / "canonical" / version
     canonical_dir.mkdir(parents=True, exist_ok=True)
@@ -118,7 +115,9 @@ class TestRegistry:
 
     def test_validate_selector_rejects_hunspell(self) -> None:
         errors = validate_selector("hunspell", "word", "v1")
-        assert any("hunspell" in e.lower() or "unsupported" in e.lower() for e in errors)
+        assert any(
+            "hunspell" in e.lower() or "unsupported" in e.lower() for e in errors
+        )
 
     def test_validate_selector_rejects_babel(self) -> None:
         errors = validate_selector("aksantara", "babel", "v1")
@@ -158,7 +157,10 @@ class TestManifestLineage:
             output_root = tmpdir / "out"
             release_root.mkdir()
             output_root.mkdir()
-            entries = [_make_entry("februari", bentuk_tidak_baku=["Pebruari"]), _make_entry("januari")]
+            entries = [
+                _make_entry("februari", bentuk_tidak_baku=["Pebruari"]),
+                _make_entry("januari"),
+            ]
             _seed_release_with_canonical(release_root, "v1", entries)
 
             manifest = generate_projection(
@@ -247,7 +249,11 @@ class TestManifestLineage:
             output_root = tmpdir / "out"
             release_root.mkdir()
             output_root.mkdir()
-            entries = [_make_entry("februari"), _make_entry("januari"), _make_entry("maret")]
+            entries = [
+                _make_entry("februari"),
+                _make_entry("januari"),
+                _make_entry("maret"),
+            ]
             _seed_release_with_canonical(release_root, "v1", entries)
             manifest = generate_projection(
                 release_root=release_root,
@@ -270,24 +276,29 @@ class TestManifestLineage:
 class TestDeterministicBytes:
     def test_fixed_inputs_and_clock_produce_byte_identical_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-                tmpdir = Path(tmp)
-                release_root = tmpdir / "release"
-                release_root.mkdir()
-                entries = [_make_entry("februari", bentuk_tidak_baku=["Pebruari"]), _make_entry("januari")]
-                _seed_release_with_canonical(release_root, "v1", entries)
+            tmpdir = Path(tmp)
+            release_root = tmpdir / "release"
+            release_root.mkdir()
+            entries = [
+                _make_entry("februari", bentuk_tidak_baku=["Pebruari"]),
+                _make_entry("januari"),
+            ]
+            _seed_release_with_canonical(release_root, "v1", entries)
 
-                # Generate twice with same clock but different dict order
-                dict_normal = {e.id: e for e in entries}
-                dict_reversed = {e.id: e for e in reversed(entries)}
+            # Generate twice with same clock but different dict order
+            dict_normal = {e.id: e for e in entries}
+            dict_reversed = {e.id: e for e in reversed(entries)}
 
-                words_normal = build_word_artifact(dict_normal, "v1")
-                words_reversed = build_word_artifact(dict_reversed, "v1")
-                assert artifact_bytes(words_normal) == artifact_bytes(words_reversed)
-                assert artifact_hash(artifact_bytes(words_normal)) == artifact_hash(artifact_bytes(words_reversed))
+            words_normal = build_word_artifact(dict_normal, "v1")
+            words_reversed = build_word_artifact(dict_reversed, "v1")
+            assert artifact_bytes(words_normal) == artifact_bytes(words_reversed)
+            assert artifact_hash(artifact_bytes(words_normal)) == artifact_hash(
+                artifact_bytes(words_reversed)
+            )
 
-                rels_normal = build_relations_artifact(dict_normal, "v1")
-                rels_reversed = build_relations_artifact(dict_reversed, "v1")
-                assert artifact_bytes(rels_normal) == artifact_bytes(rels_reversed)
+            rels_normal = build_relations_artifact(dict_normal, "v1")
+            rels_reversed = build_relations_artifact(dict_reversed, "v1")
+            assert artifact_bytes(rels_normal) == artifact_bytes(rels_reversed)
 
     def test_word_artifact_source_backed(self) -> None:
         entries = {"februari": _make_entry("februari", bentuk_tidak_baku=["Pebruari"])}
@@ -329,13 +340,25 @@ class TestDeterministicBytes:
             "februari": _make_entry("februari", bentuk_tidak_baku=["Pebruari"]),
         }
         rels = build_relations_artifact(entries, "v1")
-        assert any(r["from"] == "Pebruari" and r["to"] == "Februari" and r["canonical_field"] == "bentuk_tidak_baku" for r in rels)
+        assert any(
+            r["from"] == "Pebruari"
+            and r["to"] == "Februari"
+            and r["canonical_field"] == "bentuk_tidak_baku"
+            for r in rels
+        )
 
         entries2 = {
-            "pebruari": _make_entry("pebruari", lema="Pebruari", bentuk_baku="Februari"),
+            "pebruari": _make_entry(
+                "pebruari", lema="Pebruari", bentuk_baku="Februari"
+            ),
         }
         rels2 = build_relations_artifact(entries2, "v1")
-        assert any(r["from"] == "Pebruari" and r["to"] == "Februari" and r["canonical_field"] == "bentuk_baku" for r in rels2)
+        assert any(
+            r["from"] == "Pebruari"
+            and r["to"] == "Februari"
+            and r["canonical_field"] == "bentuk_baku"
+            for r in rels2
+        )
 
     def test_no_raw_html_or_invented_endpoint(self) -> None:
         entries = {"februari": _make_entry("februari", bentuk_tidak_baku=["Pebruari"])}
@@ -353,11 +376,15 @@ class TestDeterministicBytes:
     def test_duplicate_relations_deduplicated(self) -> None:
         entries = {
             "februari": _make_entry("februari", bentuk_tidak_baku=["Pebruari"]),
-            "pebruari": _make_entry("pebruari", lema="Pebruari", bentuk_baku="Februari"),
+            "pebruari": _make_entry(
+                "pebruari", lema="Pebruari", bentuk_baku="Februari"
+            ),
         }
         rels = build_relations_artifact(entries, "v1")
         keys = [(r["from"], r["to"], r["type"]) for r in rels]
-        assert len(keys) == len(set(keys)), "duplicate (from,to,type) should be deduplicated"
+        assert len(keys) == len(set(keys)), (
+            "duplicate (from,to,type) should be deduplicated"
+        )
 
     def test_output_files_byte_identical_with_fixed_clock(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,7 +394,10 @@ class TestDeterministicBytes:
                 output_root = tmpdir / f"out{trial}"
                 release_root.mkdir()
                 output_root.mkdir()
-                entries = [_make_entry("februari", bentuk_tidak_baku=["Pebruari"]), _make_entry("januari")]
+                entries = [
+                    _make_entry("februari", bentuk_tidak_baku=["Pebruari"]),
+                    _make_entry("januari"),
+                ]
                 _seed_release_with_canonical(release_root, "v1", entries)
                 generate_projection(
                     release_root=release_root,
@@ -378,8 +408,28 @@ class TestDeterministicBytes:
                     fixed_clock="2026-09-01T00:00:00Z",
                 )
             # Compare artifact bytes
-            data0 = (tmpdir / "out0" / "projections" / "aksantara" / "word" / "v1" / GENERATOR_VERSION / "word-v1" / "artifact.json").read_bytes()
-            data1 = (tmpdir / "out1" / "projections" / "aksantara" / "word" / "v1" / GENERATOR_VERSION / "word-v1" / "artifact.json").read_bytes()
+            data0 = (
+                tmpdir
+                / "out0"
+                / "projections"
+                / "aksantara"
+                / "word"
+                / "v1"
+                / GENERATOR_VERSION
+                / "word-v1"
+                / "artifact.json"
+            ).read_bytes()
+            data1 = (
+                tmpdir
+                / "out1"
+                / "projections"
+                / "aksantara"
+                / "word"
+                / "v1"
+                / GENERATOR_VERSION
+                / "word-v1"
+                / "artifact.json"
+            ).read_bytes()
             assert data0 == data1
 
 
@@ -390,7 +440,9 @@ class TestDeterministicBytes:
 
 class TestIdentity:
     def test_collision_safe_identity_contains_all_tuple(self) -> None:
-        identity = projection_identity("aksantara", "word", "v1", GENERATOR_VERSION, "word-v1")
+        identity = projection_identity(
+            "aksantara", "word", "v1", GENERATOR_VERSION, "word-v1"
+        )
         assert "aksantara" in identity
         assert "word" in identity
         assert "v1" in identity
@@ -398,13 +450,21 @@ class TestIdentity:
         assert "word-v1" in identity
 
     def test_different_tracks_have_different_identities(self) -> None:
-        id_word = projection_identity("aksantara", "word", "v1", GENERATOR_VERSION, "word-v1")
-        id_rel = projection_identity("aksantara", "relations", "v1", GENERATOR_VERSION, "relations-v1")
+        id_word = projection_identity(
+            "aksantara", "word", "v1", GENERATOR_VERSION, "word-v1"
+        )
+        id_rel = projection_identity(
+            "aksantara", "relations", "v1", GENERATOR_VERSION, "relations-v1"
+        )
         assert id_word != id_rel
 
     def test_different_releases_have_different_identities(self) -> None:
-        id_v1 = projection_identity("aksantara", "word", "v1", GENERATOR_VERSION, "word-v1")
-        id_v2 = projection_identity("aksantara", "word", "v2", GENERATOR_VERSION, "word-v1")
+        id_v1 = projection_identity(
+            "aksantara", "word", "v1", GENERATOR_VERSION, "word-v1"
+        )
+        id_v2 = projection_identity(
+            "aksantara", "word", "v2", GENERATOR_VERSION, "word-v1"
+        )
         assert id_v1 != id_v2
 
     def test_generate_preserves_historical_outputs(self) -> None:
@@ -418,17 +478,32 @@ class TestIdentity:
             entries_v1 = [_make_entry("februari")]
             _seed_release_with_canonical(release_root, "v1", entries_v1)
             m1 = generate_projection(
-                release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="v1", fixed_clock="2026-09-01T00:00:00Z"
+                release_root=release_root,
+                output_root=output_root,
+                consumer="aksantara",
+                track="word",
+                source_release="v1",
+                fixed_clock="2026-09-01T00:00:00Z",
             )
             hash_v1 = m1["output_hash"]
             # v2 with different content
-            entries_v2 = [_make_entry("februari", raw_suffix="-changed"), _make_entry("januari")]
+            entries_v2 = [
+                _make_entry("februari", raw_suffix="-changed"),
+                _make_entry("januari"),
+            ]
             _seed_release_with_canonical(release_root, "v2", entries_v2)
-            m2 = generate_projection(
-                release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="v2", fixed_clock="2026-09-01T00:00:00Z"
+            generate_projection(
+                release_root=release_root,
+                output_root=output_root,
+                consumer="aksantara",
+                track="word",
+                source_release="v2",
+                fixed_clock="2026-09-01T00:00:00Z",
             )
             # v1 still exists and unchanged
-            data_v1, mani_v1 = read_projection_artifact(output_root, "aksantara", "word", "v1")
+            data_v1, mani_v1 = read_projection_artifact(
+                output_root, "aksantara", "word", "v1"
+            )
             assert mani_v1["output_hash"] == hash_v1
             assert data_v1 == (output_root / m1["output_path"]).read_bytes()
 
@@ -448,7 +523,11 @@ class TestInvalidSourceBlocking:
             output_root.mkdir()
             with pytest.raises(ProjectionError) as exc:
                 generate_projection(
-                    release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="nonexistent"
+                    release_root=release_root,
+                    output_root=output_root,
+                    consumer="aksantara",
+                    track="word",
+                    source_release="nonexistent",
                 )
             assert exc.value.code == "not_found"
             assert exc.value.status == 404
@@ -467,13 +546,28 @@ class TestInvalidSourceBlocking:
             m = json.loads(mp.read_text(encoding="utf-8"))
             m["conflicts"] = [{"id": "c1"}]
             m["manifestHash"] = hashlib.sha256(
-                json.dumps({k: v for k, v in m.items() if k not in ("manifestHash", "manifest_hash")}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in m.items()
+                        if k not in ("manifestHash", "manifest_hash")
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
             ).hexdigest()
             m["manifest_hash"] = m["manifestHash"]
-            mp.write_text(json.dumps(m, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            mp.write_text(
+                json.dumps(m, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+            )
             with pytest.raises(ProjectionError) as exc:
                 generate_projection(
-                    release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="v1"
+                    release_root=release_root,
+                    output_root=output_root,
+                    consumer="aksantara",
+                    track="word",
+                    source_release="v1",
                 )
             assert exc.value.code == "ineligible"
 
@@ -488,7 +582,11 @@ class TestInvalidSourceBlocking:
             _seed_release_with_canonical(release_root, "v1", entries)
             with pytest.raises(ProjectionError) as exc:
                 generate_projection(
-                    release_root=release_root, output_root=output_root, consumer="hunspell", track="word", source_release="v1"
+                    release_root=release_root,
+                    output_root=output_root,
+                    consumer="hunspell",
+                    track="word",
+                    source_release="v1",
                 )
             assert "hunspell" in str(exc.value).lower()
 
@@ -502,21 +600,46 @@ class TestInvalidSourceBlocking:
             # Create empty valid release
             releases_dir = release_root / "releases"
             releases_dir.mkdir(parents=True, exist_ok=True)
-            empty_manifest: dict[str, object] = {"version": "empty-v1", "created_at": "2026-09-01T00:00:00Z", "entries_count": 0, "artifactHashes": {}, "canonicalHashes": {}}  # type: ignore[dict-item]
+            empty_manifest: dict[str, object] = {
+                "version": "empty-v1",
+                "created_at": "2026-09-01T00:00:00Z",
+                "entries_count": 0,
+                "artifactHashes": {},
+                "canonicalHashes": {},
+            }  # type: ignore[dict-item]
             empty_manifest["manifestHash"] = hashlib.sha256(  # type: ignore[attr-defined]
-                json.dumps({k: v for k, v in empty_manifest.items() if k not in ("manifestHash", "manifest_hash")}, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in empty_manifest.items()
+                        if k not in ("manifestHash", "manifest_hash")
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
             ).hexdigest()
             empty_manifest["manifest_hash"] = empty_manifest["manifestHash"]  # type: ignore[attr-defined]
-            (releases_dir / "empty-v1.json").write_text(json.dumps(empty_manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            (releases_dir / "empty-v1.json").write_text(
+                json.dumps(empty_manifest, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
             (release_root / "vectors" / "empty-v1").mkdir(parents=True, exist_ok=True)
             (release_root / "canonical" / "empty-v1").mkdir(parents=True, exist_ok=True)
 
             mani = generate_projection(
-                release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="empty-v1", fixed_clock="2026-09-01T00:00:00Z"
+                release_root=release_root,
+                output_root=output_root,
+                consumer="aksantara",
+                track="word",
+                source_release="empty-v1",
+                fixed_clock="2026-09-01T00:00:00Z",
             )
             assert mani["entry_count"] == 0
             assert mani["sorted_entry_ids"] == []
-            data, _ = read_projection_artifact(output_root, "aksantara", "word", "empty-v1")
+            data, _ = read_projection_artifact(
+                output_root, "aksantara", "word", "empty-v1"
+            )
             assert json.loads(data) == []
 
 
@@ -541,11 +664,22 @@ class TestNoCanonicalWrite:
             before_manifest = hashlib.sha256(manifest_file.read_bytes()).hexdigest()
 
             generate_projection(
-                release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="v1", fixed_clock="2026-09-01T00:00:00Z"
+                release_root=release_root,
+                output_root=output_root,
+                consumer="aksantara",
+                track="word",
+                source_release="v1",
+                fixed_clock="2026-09-01T00:00:00Z",
             )
 
-            assert hashlib.sha256(canonical_file.read_bytes()).hexdigest() == before_canonical
-            assert hashlib.sha256(manifest_file.read_bytes()).hexdigest() == before_manifest
+            assert (
+                hashlib.sha256(canonical_file.read_bytes()).hexdigest()
+                == before_canonical
+            )
+            assert (
+                hashlib.sha256(manifest_file.read_bytes()).hexdigest()
+                == before_manifest
+            )
 
     def test_output_root_cannot_be_canonical_namespace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -556,7 +690,11 @@ class TestNoCanonicalWrite:
             _seed_release_with_canonical(release_root, "v1", entries)
             with pytest.raises(ProjectionError) as exc:
                 generate_projection(
-                    release_root=release_root, output_root=release_root / "canonical", consumer="aksantara", track="word", source_release="v1"
+                    release_root=release_root,
+                    output_root=release_root / "canonical",
+                    consumer="aksantara",
+                    track="word",
+                    source_release="v1",
                 )
             assert exc.value.code == "unsafe_path"
 
@@ -570,10 +708,20 @@ class TestNoCanonicalWrite:
             entries = [_make_entry("februari")]
             _seed_release_with_canonical(release_root, "v1", entries)
             m1 = generate_projection(
-                release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="v1", fixed_clock="2026-09-01T00:00:00Z"
+                release_root=release_root,
+                output_root=output_root,
+                consumer="aksantara",
+                track="word",
+                source_release="v1",
+                fixed_clock="2026-09-01T00:00:00Z",
             )
             m2 = generate_projection(
-                release_root=release_root, output_root=output_root, consumer="aksantara", track="word", source_release="v1", fixed_clock="2026-09-01T00:00:00Z"
+                release_root=release_root,
+                output_root=output_root,
+                consumer="aksantara",
+                track="word",
+                source_release="v1",
+                fixed_clock="2026-09-01T00:00:00Z",
             )
             assert m1["self_hash"] == m2["self_hash"]
             assert m1["output_hash"] == m2["output_hash"]
