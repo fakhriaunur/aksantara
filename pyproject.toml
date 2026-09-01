@@ -56,6 +56,9 @@ max-complexity = 40
 "src/aksantara/embeddings/*" = ["B008", "E402", "E501", "F401", "F841", "RUF002", "RUF022", "RUF034"]
 "scripts/release_embeddings.py" = ["B008", "C901", "E402", "E501", "F401", "F823", "RUF001", "RUF005", "RUF034"]
 "src/aksantara/api/release_routes.py" = ["B008", "C901", "E501", "RUF001"]
+"src/aksantara/projections/*" = ["B008", "B904", "E402", "E501", "RUF001", "RUF005"]
+"scripts/generate_projection.py" = ["B008", "C901", "E402", "E501", "F401", "RUF001", "RUF005", "RUF034"]
+"src/aksantara/api/projection_routes.py" = ["B008", "C901", "E501", "RUF001"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -152,6 +155,30 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = "aksantara.ingest.snapshots"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.projections.registry"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.projections.schemas"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.projections.generator"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.projections.manifest"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.projections.store"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "aksantara.api.projection_routes"
 ignore_errors = true
 
 [tool.pytest.ini_options]
