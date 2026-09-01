@@ -15,6 +15,8 @@ from aksantara.domain.provenance import (
     canonical_record_bytes,
     content_hash_bytes,
 )
+from aksantara.ingest import public_replay
+from aksantara.ingest.public_replay import ReplayError, replay_snapshot
 from aksantara.parse.parser_contract import PARSER_VERSION, parse_kbbi
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -154,3 +156,119 @@ def test_public_replay_rejects_malformed_source_reference_as_json_error() -> Non
 
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "replay_source_ref_invalid"
+
+
+def test_public_replay_rejects_url_identity_mismatch_before_parsing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    raw = FIXTURE.read_bytes()
+    fixture_copy = tmp_path / "februari.html"
+    fixture_copy.write_bytes(raw)
+    source = _source(raw)
+
+    def unexpected_parse(*args, **kwargs):
+        raise AssertionError("identity mismatch must be checked before parsing")
+
+    monkeypatch.setattr(public_replay, "parse_kbbi", unexpected_parse)
+
+    try:
+        replay_snapshot(
+            root=tmp_path,
+            raw_path=fixture_copy,
+            source_ref=source,
+            expected_raw_hash=FIXTURE_HASH,
+            stable_key="maret",
+        )
+    except ReplayError as exc:
+        assert exc.code == "replay_source_identity_mismatch"
+        assert exc.details == {
+            "stable_key": "maret",
+            "source_key": "februari",
+            "source_url": source.url,
+        }
+    else:
+        raise AssertionError("mismatched source identity unexpectedly replayed")
+
+
+def test_public_replay_rejects_malformed_bracketed_url_as_json_error(
+    tmp_path: Path,
+) -> None:
+    fixture_copy = tmp_path / "februari.html"
+    fixture_copy.write_bytes(FIXTURE.read_bytes())
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "replay.py"),
+            "februari",
+            "--root",
+            str(tmp_path),
+            "--raw",
+            str(fixture_copy),
+            "--source-url",
+            "https://[bad-host/entri/februari",
+            "--json",
+        ],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    body = json.loads(result.stdout)
+    assert body["error"]["code"] == "replay_source_ref_invalid"
+    assert "traceback" not in result.stdout.lower()
+    assert "traceback" not in result.stderr.lower()
+
+
+def test_public_replay_api_rejects_url_identity_mismatch() -> None:
+    client = TestClient(create_app())
+    raw = FIXTURE.read_bytes()
+    response = client.post(
+        "/replay",
+        json={
+            "root": str(ROOT),
+            "raw_path": str(FIXTURE),
+            "source_ref": _source(raw).model_dump(mode="json"),
+            "expected_raw_hash": FIXTURE_HASH,
+            "stable_key": "maret",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "replay_source_identity_mismatch",
+            "message": "stable_key does not match the entry identity in SourceRef.url",
+            "details": {
+                "stable_key": "maret",
+                "source_key": "februari",
+                "source_url": "https://kbbi.kemdikbud.go.id/entri/februari",
+            },
+        }
+    }
+
+
+def test_public_replay_api_rejects_malformed_bracketed_url() -> None:
+    client = TestClient(create_app())
+    raw = FIXTURE.read_bytes()
+    source = _source(raw).model_dump(mode="json")
+    source["url"] = "https://[bad-host/entri/februari"
+    response = client.post(
+        "/replay",
+        json={
+            "root": str(ROOT),
+            "raw_path": str(FIXTURE),
+            "source_ref": source,
+            "expected_raw_hash": FIXTURE_HASH,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {
+            "code": "replay_source_ref_invalid",
+            "message": "source reference URL is malformed",
+            "details": {"error_type": "ValueError"},
+        }
+    }

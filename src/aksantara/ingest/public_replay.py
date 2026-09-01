@@ -76,7 +76,47 @@ def _normalise_key(value: str) -> str:
 
 
 def _key_from_source(source_ref: SourceRef) -> str:
-    path_part = source_ref.url.rstrip("/").rsplit("/", 1)[-1]
+    """Return the normalized entry identity encoded by an official URL.
+
+    ``SourceRef`` deliberately validates its data shape, not URL syntax.
+    Replay is a public boundary, so URL parsing errors must become a
+    machine-readable replay error instead of escaping as ``ValueError`` from
+    ``urlsplit`` (notably for malformed bracketed hosts).
+    """
+    try:
+        if any(
+            character.isspace() or unicodedata.category(character) in {"Cc", "Cf"}
+            for character in source_ref.url
+        ) or re.search(r"%(?![0-9A-Fa-f]{2})", source_ref.url):
+            raise ValueError("invalid URL characters")
+        parsed_url = urlsplit(source_ref.url)
+        # Accessing hostname/port performs additional validation and can raise
+        # ValueError for malformed bracketed hosts or ports.
+        hostname = parsed_url.hostname
+        _ = parsed_url.port
+    except (UnicodeError, ValueError) as exc:
+        raise ReplayError(
+            "replay_source_ref_invalid",
+            "source reference URL is malformed",
+            details={"error_type": type(exc).__name__},
+        ) from exc
+    if (
+        parsed_url.scheme != "https"
+        or hostname is None
+        or hostname.lower() != "kbbi.kemdikbud.go.id"
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        raise ReplayError(
+            "replay_official_source_required",
+            "public replay requires the official KBBI HTTPS host",
+        )
+    path_part = parsed_url.path.rstrip("/").rsplit("/", 1)[-1]
+    if not path_part:
+        raise ReplayError(
+            "replay_source_ref_invalid",
+            "source reference URL must name a KBBI entry",
+        )
     return _normalise_key(unquote(path_part))
 
 
@@ -138,6 +178,18 @@ def replay_snapshot(
                 "requested": validation_policy,
             },
         )
+    source_key = _key_from_source(source_ref)
+    key = _normalise_key(stable_key) if stable_key is not None else source_key
+    if stable_key is not None and key != source_key:
+        raise ReplayError(
+            "replay_source_identity_mismatch",
+            "stable_key does not match the entry identity in SourceRef.url",
+            details={
+                "stable_key": key,
+                "source_key": source_key,
+                "source_url": source_ref.url,
+            },
+        )
     if not isinstance(expected_raw_hash, str) or not re.fullmatch(
         r"[0-9a-fA-F]{64}", expected_raw_hash
     ):
@@ -184,15 +236,6 @@ def replay_snapshot(
             "replay_official_source_required",
             "public replay requires an official KBBI source reference",
         )
-    source_url = urlsplit(source_ref.url)
-    if (
-        source_url.scheme != "https"
-        or (source_url.hostname or "").lower() != "kbbi.kemdikbud.go.id"
-    ):
-        raise ReplayError(
-            "replay_official_source_required",
-            "public replay requires the official KBBI HTTPS host",
-        )
     if source_ref.parser_version != parser_version:
         raise ReplayError(
             "replay_parser_pin_mismatch",
@@ -202,11 +245,6 @@ def replay_snapshot(
                 "requested": parser_version,
             },
         )
-    key = (
-        _normalise_key(stable_key)
-        if stable_key is not None
-        else _key_from_source(source_ref)
-    )
     try:
         entry = parse_kbbi(raw_bytes, source_ref)
         validate_entry(entry, raw_bytes=raw_bytes)
