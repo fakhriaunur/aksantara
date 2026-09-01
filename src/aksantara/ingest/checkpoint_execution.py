@@ -83,6 +83,15 @@ class CheckpointExecutionMixin:
                 },
                 "selected_count": len(preflight.selected),
                 "outcome_counts": dict.fromkeys(_OUTCOMES, 0),
+                "fingerprints": {
+                    "catalog": preflight.catalog_fingerprint,
+                    "run": preflight.run_fingerprint,
+                },
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "references": self._references(run_dir, run_id),
                 "promotion": {
                     "candidate_created": False,
@@ -113,6 +122,15 @@ class CheckpointExecutionMixin:
                 },
                 "selected_count": len(preflight.selected),
                 "outcome_counts": dict.fromkeys(_OUTCOMES, 0),
+                "fingerprints": {
+                    "catalog": preflight.catalog_fingerprint,
+                    "run": preflight.run_fingerprint,
+                },
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "references": self._references(run_dir, run_id),
                 "promotion": {
                     "candidate_created": False,
@@ -126,17 +144,57 @@ class CheckpointExecutionMixin:
         physical_attempts: list[dict[str, Any]] = []
         for selected_index, record in enumerate(preflight.selected):
             outcome, attempt = self._process_record(record, run_dir, selected_index)
-            outcomes.append(self._annotate_outcome(outcome, run_id=run_id))
+            outcomes.append(
+                self._annotate_outcome(
+                    outcome,
+                    run_id=run_id,
+                    catalog_fingerprint=preflight.catalog_fingerprint,
+                    run_fingerprint=preflight.run_fingerprint,
+                    pins={
+                        "parser_version": preflight.parser_version,
+                        "transform_version": preflight.transform_version,
+                        "validation_policy": preflight.validation_policy,
+                    },
+                )
+            )
             logical_attempts.append(attempt)
+            attempt["run_fingerprint"] = preflight.run_fingerprint
+            attempt["pins"] = {
+                "parser_version": preflight.parser_version,
+                "transform_version": preflight.transform_version,
+                "validation_policy": preflight.validation_policy,
+            }
             source_attempts = attempt.get("source_attempts")
             if isinstance(source_attempts, list):
-                physical_attempts.extend(
-                    dict(value)
+                annotated_source_attempts = [
+                    self._annotate_physical_attempt(
+                        value,
+                        catalog_fingerprint=preflight.catalog_fingerprint,
+                        run_fingerprint=preflight.run_fingerprint,
+                        pins={
+                            "parser_version": preflight.parser_version,
+                            "transform_version": preflight.transform_version,
+                            "validation_policy": preflight.validation_policy,
+                        },
+                    )
                     for value in source_attempts
                     if isinstance(value, Mapping)
-                )
+                ]
+                attempt["source_attempts"] = annotated_source_attempts
+                physical_attempts.extend(annotated_source_attempts)
             else:
-                physical_attempts.append(attempt)
+                physical_attempts.append(
+                    self._annotate_physical_attempt(
+                        attempt,
+                        catalog_fingerprint=preflight.catalog_fingerprint,
+                        run_fingerprint=preflight.run_fingerprint,
+                        pins={
+                            "parser_version": preflight.parser_version,
+                            "transform_version": preflight.transform_version,
+                            "validation_policy": preflight.validation_policy,
+                        },
+                    )
+                )
 
         outcome_counts = dict.fromkeys(_OUTCOMES, 0)
         for item in outcomes:
@@ -207,6 +265,15 @@ class CheckpointExecutionMixin:
                 "run_id": run_id,
                 "revision": revision,
                 "snapshot": f"{run_id}:r{revision}",
+                "fingerprints": {
+                    "catalog": preflight.catalog_fingerprint,
+                    "run": preflight.run_fingerprint,
+                },
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "selected_count": len(outcomes),
                 "outcomes": outcomes,
             },
@@ -222,6 +289,15 @@ class CheckpointExecutionMixin:
                 "physical_attempt_count": len(physical_attempts),
                 "logical_attempt_count": len(logical_attempts),
                 "transport_attempt_count": len(physical_attempts),
+                "fingerprints": {
+                    "catalog": preflight.catalog_fingerprint,
+                    "run": preflight.run_fingerprint,
+                },
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "attempts": logical_attempts,
                 "physical_attempts": physical_attempts,
             },
@@ -243,6 +319,15 @@ class CheckpointExecutionMixin:
                 "selected_keys": preflight.selected_keys,
                 "outcome_counts": outcome_counts,
                 "processed_count": len(outcomes),
+                "fingerprints": {
+                    "catalog": preflight.catalog_fingerprint,
+                    "run": preflight.run_fingerprint,
+                },
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "terminal_count": sum(
                     count
                     for name, count in outcome_counts.items()
@@ -269,6 +354,15 @@ class CheckpointExecutionMixin:
                 "selected_count": len(preflight.selected),
                 "outcome_counts": outcome_counts,
                 "completion": report["completion"],
+                "fingerprints": {
+                    "catalog": preflight.catalog_fingerprint,
+                    "run": preflight.run_fingerprint,
+                },
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "references": self._references(run_dir, run_id),
                 "promotion": report["promotion"],
             },
@@ -290,7 +384,14 @@ class CheckpointExecutionMixin:
         return process_record(self, record, run_dir, selected_index)
 
     @staticmethod
-    def _annotate_outcome(outcome: Mapping[str, Any], *, run_id: str) -> dict[str, Any]:
+    def _annotate_outcome(
+        outcome: Mapping[str, Any],
+        *,
+        run_id: str,
+        catalog_fingerprint: str,
+        run_fingerprint: str,
+        pins: Mapping[str, Any],
+    ) -> dict[str, Any]:
         """Add report-level aliases while retaining the processor evidence."""
         value = dict(outcome)
         status = str(value.get("outcome", ""))
@@ -310,6 +411,25 @@ class CheckpointExecutionMixin:
         value["canonical_hash"] = value.get("canonical_content_hash")
         value["attempt_history_reference"] = "attempts.json"
         value["attempt_run_id"] = run_id
+        value["run_id"] = run_id
+        value["catalog_fingerprint"] = catalog_fingerprint
+        value["run_fingerprint"] = run_fingerprint
+        value["pins"] = dict(pins)
+        return value
+
+    @staticmethod
+    def _annotate_physical_attempt(
+        attempt: Mapping[str, Any],
+        *,
+        catalog_fingerprint: str,
+        run_fingerprint: str,
+        pins: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Attach immutable run identity to each physical observation row."""
+        value = dict(attempt)
+        value["catalog_fingerprint"] = catalog_fingerprint
+        value["run_fingerprint"] = run_fingerprint
+        value["pins"] = dict(pins)
         return value
 
     @staticmethod
@@ -395,15 +515,22 @@ class CheckpointExecutionMixin:
                 "entry_id": item.get("entry_id"),
                 "run_id": run_id,
                 "run_fingerprint": preflight.run_fingerprint,
+                "catalog_fingerprint": preflight.catalog_fingerprint,
                 "source_ref": item.get("source_ref"),
                 "source_role": item.get("source_role"),
                 "authority_role": item.get("authority_role"),
+                "pins": {
+                    "parser_version": preflight.parser_version,
+                    "transform_version": preflight.transform_version,
+                    "validation_policy": preflight.validation_policy,
+                },
                 "raw_hash": item.get("raw_hash"),
                 "raw_content_hash": item.get("raw_hash"),
                 "canonical_hash": item.get("canonical_content_hash"),
                 "canonical_content_hash": item.get("canonical_content_hash"),
                 "raw_snapshot_id": item.get("raw_snapshot_id"),
                 "observation_id": item.get("observation_id"),
+                "attempt_id": item.get("attempt_id"),
                 "official_observation": item.get("official_observation"),
                 "canonical_reference": item.get("canonical_reference"),
                 "parsed_reference": item.get("parsed_reference"),
@@ -587,6 +714,7 @@ class CheckpointExecutionMixin:
                     "canonical_content_hash",
                     "raw_snapshot_id",
                     "observation_id",
+                    "attempt_id",
                 ],
             },
             "promotion": {

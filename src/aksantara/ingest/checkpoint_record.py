@@ -9,6 +9,7 @@ from typing import Any, Protocol
 from aksantara.domain.provenance import CANONICAL_RECORD_FIELDS, canonical_record_bytes
 from aksantara.ingest.checkpoint_authority import _source_identity
 from aksantara.ingest.checkpoint_storage import (
+    _read_json,
     _safe_relative,
     _write_immutable,
     _write_json,
@@ -110,6 +111,22 @@ def _process_record_with_observation_lineage(
         _append_physical_result(result, physical_attempts, observations)
         evidence_results.append(result)
 
+    preflight_payload = _read_json(run_dir / "preflight.json")
+    preflight_fingerprints = preflight_payload.get("fingerprints", {})
+    preflight_pins = preflight_payload.get("pins", {})
+    if not isinstance(preflight_fingerprints, Mapping) or not isinstance(
+        preflight_pins, Mapping
+    ):
+        raise ValueError("durable preflight lineage metadata is malformed")
+    for attempt in physical_attempts:
+        attempt["catalog_fingerprint"] = preflight_fingerprints.get("catalog")
+        attempt["run_fingerprint"] = preflight_fingerprints.get("run")
+        attempt["pins"] = {
+            "parser_version": preflight_pins.get("parser_version"),
+            "transform_version": preflight_pins.get("transform_version"),
+            "validation_policy": preflight_pins.get("validation_policy"),
+        }
+
     if selected_official is None:
         return _finish_without_official(
             driver,
@@ -143,13 +160,49 @@ def _process_record_with_observation_lineage(
         canonical_record_bytes(winner_entry),
         driver.root,
     )
+    attempt = selected_official["attempt"]
+    source_identity = _source_identity(selected_official["source_ref"])
+    lineage = {
+        "run_id": run_dir.name,
+        "stable_key": record.stable_key,
+        "attempt_id": attempt["attempt_id"],
+        "catalog_fingerprint": preflight_fingerprints.get("catalog"),
+        "run_fingerprint": preflight_fingerprints.get("run"),
+        "pins": {
+            "parser_version": preflight_pins.get("parser_version"),
+            "transform_version": preflight_pins.get("transform_version"),
+            "validation_policy": preflight_pins.get("validation_policy"),
+        },
+        "source_ref": source_identity,
+        "source_role": "official",
+        "authority_role": "official",
+        "raw_hash": attempt.get("raw_hash"),
+        "raw_content_hash": attempt.get("raw_content_hash"),
+        "raw_snapshot_id": attempt.get("raw_snapshot_id"),
+        "observation_id": attempt.get("observation_id"),
+        "raw_reference": attempt.get("raw_reference"),
+        "canonical_reference": _safe_relative(driver.root, canonical_path),
+        "canonical_content_hash": canonical_hash,
+        "entry_id": winner_entry.id,
+    }
     _write_json(
         parsed_path,
         {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "run_id": run_dir.name,
             "stable_key": record.stable_key,
             "entry": canonical_payload,
             "canonical_content_hash": canonical_hash,
+            "fingerprints": {
+                "catalog": preflight_fingerprints.get("catalog"),
+                "run": preflight_fingerprints.get("run"),
+            },
+            "pins": {
+                "parser_version": preflight_pins.get("parser_version"),
+                "transform_version": preflight_pins.get("transform_version"),
+                "validation_policy": preflight_pins.get("validation_policy"),
+            },
+            "lineage": lineage,
             "canonical_serialization": {
                 "algorithm": "canonical-record-v1",
                 "fields": list(CANONICAL_RECORD_FIELDS),
@@ -459,6 +512,11 @@ def _review_side(
     return {
         "attempt_id": attempt["attempt_id"],
         "run_id": attempt["run_id"],
+        "stable_key": observation["stable_key"],
+        "entry_id": entry.id,
+        "catalog_fingerprint": attempt.get("catalog_fingerprint"),
+        "run_fingerprint": attempt.get("run_fingerprint"),
+        "pins": dict(attempt.get("pins", {})),
         "source_ref": dict(observation["source_ref"]),
         "source_kind": observation["source_kind"],
         "source_role": observation["source_role"],
@@ -467,6 +525,8 @@ def _review_side(
         "raw_snapshot_id": attempt.get("raw_snapshot_id"),
         "observation_id": attempt.get("observation_id"),
         "raw_reference": attempt.get("raw_reference"),
+        "parsed_reference": attempt.get("parsed_reference"),
+        "canonical_reference": attempt.get("canonical_reference"),
         "canonical_content_hash": canonical_hash,
         "entry": entry.model_dump(mode="json"),
     }
@@ -571,6 +631,7 @@ def _accepted_outcome(
         "authority_role": "official",
         "raw_snapshot_id": attempt.get("raw_snapshot_id"),
         "observation_id": attempt.get("observation_id"),
+        "attempt_id": attempt["attempt_id"],
         "entry_id": entry.id,
         "lema": entry.lema,
         "candidate_namespace": False,
