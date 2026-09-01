@@ -11,6 +11,7 @@ from typing import Any
 
 from aksantara.domain.provenance import content_hash_bytes
 from aksantara.ingest.checkpoint_types import (
+    CheckpointFencedError,
     CheckpointNotFoundError,
     CheckpointPersistenceError,
 )
@@ -165,13 +166,90 @@ def _redact_catalog_request(catalog: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _acquire_file_lock(lock_path: Path) -> Any:
+    """Acquire an exclusive caller-owned file lock for concurrent serialization.
+
+    Uses fcntl on POSIX; falls back to threading on unsupported platforms.
+    The lock file is created under the caller root and never escapes it.
+    """
+    import fcntl  # type: ignore[import-untyped]
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    except OSError as exc:
+        handle.close()
+        raise CheckpointPersistenceError(
+            "could not acquire caller-owned lock",
+            details={"path": str(lock_path), "error_type": type(exc).__name__},
+        ) from exc
+    return handle
+
+
+def _release_file_lock(handle: Any) -> None:
+    import fcntl  # type: ignore[import-untyped]
+
+    try:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _lease_path(run_dir: Path) -> Path:
+    return run_dir / "lease.json"
+
+
+def _barrier_path(run_dir: Path) -> Path:
+    return run_dir / "barrier.json"
+
+
+def _read_lease(run_dir: Path) -> dict[str, Any] | None:
+    path = _lease_path(run_dir)
+    if not path.is_file():
+        return None
+    return _read_json(path)
+
+
+def _write_lease(run_dir: Path, payload: dict[str, Any], root: Path) -> None:
+    _write_state_json(_lease_path(run_dir), payload, root)
+
+
+def _check_fence(run_dir: Path, expected_generation: int) -> None:
+    """Reject a stale generation that lost the lease.
+
+    Called before every durable write; if the on-disk lease has a newer
+    generation than the caller's expected_generation, the write is fenced.
+    """
+    current = _read_lease(run_dir)
+    if current is None:
+        return
+    current_gen = int(current.get("generation", 0))
+    if current_gen != expected_generation:
+        raise CheckpointFencedError(
+            "stale generation is fenced after lease reclaim",
+            details={
+                "expected_generation": expected_generation,
+                "current_generation": current_gen,
+                "run_id": run_dir.name,
+            },
+        )
+
+
 __all__ = [
+    "_acquire_file_lock",
+    "_barrier_path",
     "_canonical_bytes",
+    "_check_fence",
     "_hash_payload",
+    "_lease_path",
     "_read_json",
+    "_read_lease",
     "_redact_catalog_request",
+    "_release_file_lock",
     "_safe_relative",
     "_write_immutable",
     "_write_json",
+    "_write_lease",
     "_write_state_json",
 ]

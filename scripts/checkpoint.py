@@ -76,6 +76,28 @@ def _common_parser() -> argparse.ArgumentParser:
     common.add_argument("--release-reviewer", help="Human release approver identity")
     common.add_argument("--release-reason", help="Release approval reason")
     common.add_argument(
+        "--barrier",
+        choices=(
+            "before-write",
+            "durable-write-before-ack",
+            "checkpoint-before-cursor",
+            "combined-transaction",
+        ),
+        help="Caller-owned, process-scoped, local-only barrier phase that returns barrier_id and holds owned worker; cannot target cloud/production",
+    )
+    common.add_argument(
+        "--barrier-hold",
+        help="Seconds to hold worker at barrier (e.g. 5); process-scoped, local-only",
+    )
+    common.add_argument(
+        "--interrupt-after",
+        help="Interrupt after N committed keys (caller-owned fault control, local-only; leaves resumable interrupted state)",
+    )
+    common.add_argument(
+        "--fault",
+        help="Alias for --barrier (caller-owned fault control, local-only)",
+    )
+    common.add_argument(
         "--json",
         action="store_true",
         help="Emit one machine-readable JSON object instead of human text",
@@ -93,8 +115,13 @@ def _parser() -> argparse.ArgumentParser:
             "stable keys plus SourceRef identity. Local mode accepts only "
             "caller-owned fixture manifests under the caller root; it never "
             "uses live network/GCP/emulator or promotes a release. "
-            "See the contract operation for lifecycle, idempotency, outcomes, "
-            "roots, pins, and error mappings."
+            "Run lifecycle is closed: created, running, interrupted, blocked, failed, completed. "
+            "Only interrupted is resumable; blocked/failed/completed cannot silently reopen. "
+            "Checkpoint commit precedes cursor advancement; snapshots are complete revisions with cursor/revision semantics. "
+            "Leases fence stale generations after reclaim; concurrent identical starts/resumes serialize to one owner/generation. "
+            "Barrier/fault controls (--barrier, --barrier-hold, --interrupt-after, --fault) are caller-owned, process-scoped, "
+            "local-only and documented before use; they cannot target cloud or production state. "
+            "See the contract operation for lifecycle, idempotency, cursor, checkpoint, lease, barrier, and error mappings."
         ),
         parents=[common],
     )
@@ -102,13 +129,39 @@ def _parser() -> argparse.ArgumentParser:
     for name, help_text in (
         ("contract", "Print the complete machine-readable contract"),
         ("preflight", "Validate catalog and print stable selection without reads"),
-        ("run", "Create, durably execute, and report a local checkpoint"),
-        ("status", "Read a durable run status"),
+        (
+            "run",
+            "Create, durably execute, and report a local checkpoint (supports --barrier/--interrupt-after)",
+        ),
+        (
+            "status",
+            "Read a durable run status with lease, cursor, revision, and totals",
+        ),
         ("report", "Read a conserved durable run report"),
-        ("outcomes", "Read one current outcome per selected key"),
-        ("attempts", "Read per-source attempt history"),
-        ("history", "Read immutable checkpoint run history"),
-        ("checkpoint", "Read the durable checkpoint revision"),
+        (
+            "outcomes",
+            "Read one current outcome per selected key (one row per key, revision snapshot)",
+        ),
+        (
+            "attempts",
+            "Read per-source attempt history (separate from current outcomes, with revision)",
+        ),
+        (
+            "history",
+            "Read immutable checkpoint run history with fingerprints and lease",
+        ),
+        (
+            "checkpoint",
+            "Read the durable checkpoint revision with cursor/window semantics and lease",
+        ),
+        (
+            "lease",
+            "Read lease/fence diagnostics (owner, generation, fence_token, expiry, heartbeat, reclaim)",
+        ),
+        (
+            "resume",
+            "Resume an interrupted run with same tuple; drift creates blocked, same completed is no-op, stale generation fenced",
+        ),
         ("execute", "Read an existing run as an idempotent no-op"),
         ("review-queue", "Read the deterministic open authority review queue"),
         ("review-read", "Read one authority review record"),
@@ -183,11 +236,71 @@ def _operation(args: argparse.Namespace) -> Any:
         catalog = _load_catalog(args.catalog, driver.root)
         if operation == "preflight":
             return driver.preflight(catalog, limit=args.limit).to_dict()
+        # Parse fault/barrier controls (caller-owned, local-only)
+        barrier = args.barrier or args.fault
+        barrier_hold = None
+        if args.barrier_hold is not None:
+            try:
+                barrier_hold = float(args.barrier_hold)
+            except ValueError as exc:
+                raise CheckpointError(
+                    "--barrier-hold must be a number",
+                    details={"value": args.barrier_hold},
+                ) from exc
+        interrupt_after = None
+        if args.interrupt_after is not None:
+            try:
+                interrupt_after = int(str(args.interrupt_after).strip())
+            except ValueError as exc:
+                raise CheckpointError(
+                    "--interrupt-after must be an integer",
+                    details={"value": args.interrupt_after},
+                ) from exc
         return driver.run(
             catalog,
             limit=args.limit,
             idempotency_key=args.idempotency_key,
+            barrier=barrier,
+            barrier_hold=barrier_hold,
+            interrupt_after=interrupt_after,
         ).to_dict()
+    if operation == "resume":
+        if not args.run_id:
+            raise CheckpointNotFoundError(
+                "--run-id is required for resume",
+                details={"operation": operation},
+            )
+        if not args.catalog:
+            raise CheckpointError(
+                "--catalog is required for resume to verify fingerprint drift",
+                details={"operation": operation},
+            )
+        catalog = _load_catalog(args.catalog, driver.root)
+        barrier = args.barrier or args.fault
+        barrier_hold = None
+        if args.barrier_hold is not None:
+            try:
+                barrier_hold = float(args.barrier_hold)
+            except ValueError as exc:
+                raise CheckpointError(
+                    "--barrier-hold must be a number",
+                    details={"value": args.barrier_hold},
+                ) from exc
+        return driver.resume(
+            args.run_id,
+            catalog,
+            limit=args.limit,
+            idempotency_key=args.idempotency_key,
+            barrier=barrier,
+            barrier_hold=barrier_hold,
+        ).to_dict()
+    if operation == "lease":
+        if not args.run_id:
+            raise CheckpointNotFoundError(
+                "--run-id is required for lease",
+                details={"operation": operation},
+            )
+        return driver.lease_status(args.run_id)
     if operation == "review-queue":
         reviews = driver.review_queue()
         return {

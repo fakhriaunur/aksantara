@@ -33,6 +33,7 @@ from aksantara.validate.review import (
 __all__ = [
     "CandidateEvaluationRequest",
     "CheckpointCreateRequest",
+    "CheckpointResumeRequest",
     "ReviewDecisionRequest",
     "create_checkpoint_router",
 ]
@@ -62,6 +63,61 @@ class CheckpointCreateRequest(BaseModel):
     idempotency_key: str | None = Field(
         default=None,
         description="Caller key scoped to root and the complete run tuple",
+    )
+    mode: str = Field(
+        default="local-fixture-only",
+        description="Only local-fixture-only is supported; cloud mode is rejected",
+    )
+    barrier: str | None = Field(
+        default=None,
+        description="Caller-owned, process-scoped, local-only barrier phase: before-write, durable-write-before-ack, checkpoint-before-cursor, combined-transaction; cannot target cloud/production",
+    )
+    barrier_hold: float | None = Field(
+        default=None,
+        description="Seconds to hold owned worker at barrier (e.g. 2); process-scoped, local-only",
+    )
+    interrupt_after: int | None = Field(
+        default=None,
+        description="Interrupt after N committed keys (caller-owned fault control, local-only; leaves resumable interrupted state)",
+    )
+    fault: str | None = Field(
+        default=None,
+        description="Alias for barrier (caller-owned, process-scoped, local-only)",
+    )
+
+
+class CheckpointResumeRequest(BaseModel):
+    """Resume an interrupted run with fencing and fingerprint drift checks."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    root: str = Field(
+        min_length=1,
+        description="Caller-owned root containing the durable run",
+    )
+    catalog_path: str | None = Field(
+        default=None,
+        description="Catalog path for drift check; must be under root; same tuple required for resume",
+    )
+    catalog: dict[str, Any] | None = Field(
+        default=None,
+        description="Inline catalog for drift check; same fingerprint required",
+    )
+    limit: int | str | None = Field(
+        default=None,
+        description="Effective limit; must match original run tuple",
+    )
+    idempotency_key: str | None = Field(
+        default=None,
+        description="Idempotency key; changed tuple returns typed 409 conflict",
+    )
+    barrier: str | None = Field(
+        default=None,
+        description="Optional barrier phase for resumed run (local-only)",
+    )
+    barrier_hold: float | None = Field(
+        default=None,
+        description="Seconds to hold at barrier during resume",
     )
     mode: str = Field(
         default="local-fixture-only",
@@ -144,7 +200,9 @@ def _review_error_response(error: ReviewError) -> HTTPException:
     )
 
 
-def _load_catalog(request: CheckpointCreateRequest, root: Path) -> dict[str, Any]:
+def _load_catalog(
+    request: CheckpointCreateRequest | CheckpointResumeRequest, root: Path
+) -> dict[str, Any]:
     if request.mode != "local-fixture-only":
         raise CatalogValidationError(
             "checkpoint API only supports local-fixture-only mode",
@@ -190,6 +248,34 @@ def _load_catalog(request: CheckpointCreateRequest, root: Path) -> dict[str, Any
     if not isinstance(value, dict):
         raise CatalogValidationError("catalog_path must contain a JSON object")
     return value
+
+
+def _validate_barrier(
+    request: CheckpointCreateRequest | CheckpointResumeRequest,
+) -> tuple[str | None, float | None]:
+    barrier = request.barrier or getattr(request, "fault", None)
+    hold = getattr(request, "barrier_hold", None)
+    if barrier is not None and barrier not in {
+        "before-write",
+        "durable-write-before-ack",
+        "checkpoint-before-cursor",
+        "combined-transaction",
+    }:
+        raise CatalogValidationError(
+            "unsupported barrier phase",
+            details={
+                "phase": barrier,
+                "allowed": [
+                    "before-write",
+                    "durable-write-before-ack",
+                    "checkpoint-before-cursor",
+                    "combined-transaction",
+                ],
+            },
+        )
+    if hold is not None and hold < 0:
+        raise CatalogValidationError("barrier hold must be non-negative")
+    return barrier, hold
 
 
 def _driver_for(run_id: str, root: str | None) -> CheckpointDriver:
@@ -248,7 +334,13 @@ def create_checkpoint_router() -> APIRouter:
         description=(
             "Local-only mutation. Requires a caller-owned root and fixture "
             "catalog. Preflight validates identity, paths, hosts, hashes, and "
-            "limit before any fixture read. It never promotes a release."
+            "limit before any fixture read. It never promotes a release. "
+            "Closed lifecycle: created, running, interrupted, blocked, failed, completed. "
+            "Only interrupted is resumable via POST /checkpoints/runs/{run_id}/resume. "
+            "Checkpoint commit precedes cursor advancement; cursor is monotonic and bounded. "
+            "Supports caller-owned, process-scoped, local-only barrier/fault controls (--barrier, --barrier-hold, --interrupt-after) "
+            "that cannot target cloud/production. Barrier phases: before-write, durable-write-before-ack, "
+            "checkpoint-before-cursor, combined-transaction. Leases fence stale generations after reclaim."
         ),
     )
     def create_run(request: CheckpointCreateRequest) -> dict[str, Any]:
@@ -256,16 +348,79 @@ def create_checkpoint_router() -> APIRouter:
             root = Path(request.root).expanduser().resolve()
             driver = CheckpointDriver(root=root)
             catalog = _load_catalog(request, root)
+            barrier, hold = _validate_barrier(request)
+            interrupt_after = getattr(request, "interrupt_after", None)
             result = driver.run(
                 catalog,
                 limit=request.limit,
                 idempotency_key=request.idempotency_key,
+                barrier=barrier,
+                barrier_hold=hold,
+                interrupt_after=interrupt_after,
             )
         except CheckpointError as exc:
             raise _error_response(exc) from exc
         with _drivers_lock:
             _drivers[(result.run_id, str(driver.root))] = driver
         return result.to_dict()
+
+    @router.post(
+        "/runs/{run_id}/resume",
+        summary="Resume an interrupted checkpoint run",
+        operation_id="checkpoint_resume_run",
+        response_model=dict[str, Any],
+        description=(
+            "Local-only resume of an interrupted run with same tuple. "
+            "Verifies fingerprint drift: changed catalog/limit/pins return 409 blocked/conflict without mutating old state. "
+            "Same tuple on completed is no-op. Reclaims lease with new generation and fences stale generation. "
+            "Only published uncommitted/in-flight work (keys beyond cursor) may repeat; committed keys never repeat. "
+            "Supports caller-owned barrier controls for resumed window. Cannot target cloud/production."
+        ),
+    )
+    def resume_run(
+        run_id: str,
+        request: CheckpointResumeRequest,
+    ) -> dict[str, Any]:
+        try:
+            root = Path(request.root).expanduser().resolve()
+            driver = CheckpointDriver(root=root)
+            catalog = _load_catalog(request, root)
+            barrier, hold = _validate_barrier(request)
+            result = driver.resume(
+                run_id,
+                catalog,
+                limit=request.limit,
+                idempotency_key=request.idempotency_key,
+                barrier=barrier,
+                barrier_hold=hold,
+            )
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
+        with _drivers_lock:
+            _drivers[(run_id, str(root))] = driver
+        return result.to_dict()
+
+    @router.get(
+        "/runs/{run_id}/lease",
+        summary="Read lease/fence diagnostics",
+        operation_id="checkpoint_run_lease",
+        response_model=dict[str, Any],
+        description=(
+            "Local-only lease diagnostics. Exposes owner, operation, generation/fence_token, expiry/heartbeat, and reclaim. "
+            "Stale generations are fenced after lease reclaim and cannot change checkpoint, cursor, canonical, candidate, or pointer."
+        ),
+    )
+    def run_lease(
+        run_id: str,
+        root: str | None = Query(
+            default=None,
+            description="Caller-owned root; required after process restart",
+        ),
+    ) -> dict[str, Any]:
+        try:
+            return _driver_for(run_id, root).lease_status(run_id)
+        except CheckpointError as exc:
+            raise _error_response(exc) from exc
 
     @router.post(
         "/runs/{run_id}/execute",

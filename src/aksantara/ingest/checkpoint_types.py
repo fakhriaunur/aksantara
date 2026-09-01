@@ -55,6 +55,24 @@ _OUTCOMES = (
     "failed",
 )
 _TERMINAL_OUTCOMES = {"accepted", "quarantined", "rejected", "failed"}
+_RUN_STATES = (
+    "created",
+    "running",
+    "interrupted",
+    "blocked",
+    "failed",
+    "completed",
+)
+_TERMINAL_RUN_STATES = {"blocked", "failed", "completed"}
+_RESUMABLE_RUN_STATES = {"interrupted"}
+_BARRIER_PHASES = (
+    "before-write",
+    "durable-write-before-ack",
+    "checkpoint-before-cursor",
+    "combined-transaction",
+)
+_LEASE_TTL_SECONDS = 60
+_LEASE_HEARTBEAT_SECONDS = 10
 
 
 class CheckpointError(AksantaraDomainError):
@@ -116,6 +134,27 @@ class CheckpointPersistenceError(CheckpointError):
 
     code = "persistence_error"
     status_code = 503
+
+
+class CheckpointFencedError(CheckpointError):
+    """A stale generation attempted to write after lease reclaim."""
+
+    code = "lease_fenced"
+    status_code = 409
+
+
+class CheckpointBlockedError(CheckpointError):
+    """Material fingerprint drift requires a separate run."""
+
+    code = "run_blocked"
+    status_code = 409
+
+
+class CheckpointResumeError(CheckpointError):
+    """Resume preconditions failed."""
+
+    code = "resume_conflict"
+    status_code = 409
 
 
 @dataclass(frozen=True, slots=True)
