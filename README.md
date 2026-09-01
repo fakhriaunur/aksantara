@@ -114,6 +114,65 @@ immutable report history, public replay contract, and FastAPI
 [`docs/checkpoint-driver.md`](docs/checkpoint-driver.md). An accepted
 checkpoint is evidence only, never an implicit candidate or release.
 
+## Phase 3 End-to-End Composition — Checkpoint → Resume → Release → Retrieval → Projection
+
+A 100-entry local run traverses **checkpoint → resume → incremental release → active retrieval/citation → projection** with joinable identities; quarantined records never reach embeddings, releases, retrieval, or projections; interrupted vs uninterrupted output is equal after only documented volatile fields; delta/history is preserved.
+
+The single authoritative flow (see [`docs/phase3-composition.md`](docs/phase3-composition.md) for the full stage/identity join table, failure matrix, and hash lineage):
+
+```text
+catalog_selected -> run_started -> checkpoint_committed -> candidate_ready
+  -> embedding_planned -> vectors_persisted -> candidate_verified -> release_validated -> pointer_current
+    -> branch api_read_verified, branch projection_verified
+```
+
+**Resume & recovery:**
+
+```bash
+python scripts/checkpoint.py run --root /tmp/ck --catalog catalog.json --limit 100 --interrupt-after 5 --json
+python scripts/checkpoint.py resume --root /tmp/ck --run-id checkpoint-<fp> --catalog catalog.json --limit 100 --json
+# Barrier/fault seams (caller-owned, process-scoped, local-only; cannot target cloud)
+python scripts/checkpoint.py run --root /tmp/ck --catalog catalog.json --limit 100 --barrier checkpoint-before-cursor --barrier-hold 2 --json
+python scripts/checkpoint.py run --root /tmp/ck --catalog catalog.json --limit 100 --persistence-fault checkpoint --persistence-fault-phase before_write --json
+```
+
+**Incremental release & pointer (all caller-owned, local-only, never implicitly promote):**
+
+```bash
+python scripts/release_embeddings.py seed --root /tmp/release --version v1 --canonical-dir fixtures/canonical --json
+python scripts/release_embeddings.py plan --root /tmp/release --prior v1 --candidate v2 --prior-canonical-dir fixtures/prior --candidate-canonical-dir fixtures/candidate --json
+python scripts/release_embeddings.py build --root /tmp/release --plan-id plan-v1-to-v2 --mode local --fixed-clock 2026-09-01T00:00:00Z --json
+python scripts/release_embeddings.py verify --root /tmp/release --release v2 --json
+python scripts/release_embeddings.py promote --root /tmp/release --candidate v2 --expected-version v1 --expected-generation gen-1 --reviewer alice --reason "approve" --policy release-v1 --json
+python scripts/release_embeddings.py current --root /tmp/release --json
+python scripts/release_embeddings.py rollback --root /tmp/release --target v1 --expected-version v2 --expected-generation gen-2 --reviewer alice --reason "rollback" --policy release-v1 --json
+```
+
+Invalid promotion leaves the old pointer active; valid promotion/rollback change only the pointer + one append-only history event while preserving all versioned data.
+
+**Active retrieval (one validated snapshot per request) and fail-closed semantics:**
+
+```bash
+curl -s "http://127.0.0.1:8000/entries/entry-999" | jq .citation
+curl -s "http://127.0.0.1:8000/search/semantic?q=xyzabc123" | jq  # -> {"results":[]}
+```
+
+Citations carry `source_release`, `manifest_hash`, `canonical_content_hash`, `raw_content_hash`, `source {url, edition, source_version, retrievedAt}`, and `retrieval`.
+
+**Projection (generic `word`/`relations`, atomic visibility, upstream read-only):**
+
+```bash
+python scripts/generate_projection.py registry --json | jq .allowed_tracks
+python scripts/generate_projection.py generate --release-root /tmp/release --output-root /tmp/out --consumer aksantara --track word --release v2 --fixed-clock 2026-09-01T00:00:00Z --json
+python scripts/generate_projection.py verify --output-root /tmp/out --consumer aksantara --track word --release v2 --json
+```
+
+Rejected downstream products (`hunspell`/`cspell`/`babel`/`polyglossia`/`rabu-baku`) are blocked; missing/invalid/unvalidated sources fail before validated publication.
+
+**Provenance joins:** `raw_content_hash` (SHA-256 raw bytes), `canonical_content_hash` (published JSON bytes), `embedding_document_hash`, `manifestHash`, `source_release`, `output_hash`/`self_hash` — all lower-case hex, byte-verified.
+
+**Boundaries & safety:** local mode makes zero GCP/provider/network writes; approved sandbox is `ata-devpost-sandbox` / Firestore `(default)` `asia-southeast1` / `gs://ata-devpost-sandbox-aksantara` (one fixture entry, unique release, bounded 768-dim `gemini-embedding-001` call only after explicit approval). Baseline reads are public; mutations require explicit caller-owned roots; secrets never appear in logs/responses; only owned staging/locks/processes/ports are cleaned, historical evidence (`releases/`, `vectors/`, `registry/history.json`) is never deleted. See [`docs/projection-publication.md`](docs/projection-publication.md) for atomic publication proofs and [`docs/downstream-contract.md`](docs/downstream-contract.md) for manifest schemas.
+
 ## Interactive QA — Agent-Followable End-to-End
 
 A complete, documented path to bring the app to an interactive state and exercise it. No external credentials required for the in-memory slice (Firestore/Vertex optional).
