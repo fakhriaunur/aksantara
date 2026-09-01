@@ -26,11 +26,13 @@ with the ``get_*`` dependency functions exposed below.
 
 from __future__ import annotations
 
+import time
+import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from aksantara.api.checkpoint_routes import create_checkpoint_router
@@ -38,6 +40,12 @@ from aksantara.api.projection_routes import create_projection_router
 from aksantara.api.release_routes import create_release_router
 from aksantara.api.replay_routes import create_replay_router
 from aksantara.domain.models import KBBIEntry
+from aksantara.logging.structured import (
+    bind_context,
+    clear_context,
+    configure_structured_logging,
+    get_logger,
+)
 from aksantara.retrieve.citations import RetrievalInfo, render_citation
 from aksantara.retrieve.exact import ExactLookup, InMemoryExactIndex
 from aksantara.retrieve.prefix import PrefixLookup
@@ -726,6 +734,9 @@ def create_app(
     """
     from fastapi import FastAPI
 
+    configure_structured_logging()
+    _api_logger = get_logger("aksantara.api")
+
     app = FastAPI(
         title="Aksantara Pramana API",
         description="KBBI-first exact / prefix / semantic retrieval with provenance citations",
@@ -733,6 +744,45 @@ def create_app(
         docs_url="/docs",
         redoc_url="/redoc",
     )
+
+    @app.middleware("http")  # type: ignore[misc]
+    async def _structured_logging_middleware(request: Request, call_next: Any) -> Any:
+        request_id = (
+            request.headers.get("x-request-id")
+            or request.headers.get("X-Request-ID")
+            or str(uuid.uuid4())
+        )
+        trace_id = (
+            request.headers.get("x-cloud-trace-context", "").split("/")[0] or None
+        )
+        bind_context(request_id=request_id, trace_id=trace_id)
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)  # type: ignore[no-untyped-call]
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            _api_logger.info(
+                "http_request",
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+                duration_ms=duration_ms,
+                request_id=request_id,
+            )
+            response.headers["X-Request-ID"] = request_id
+            return response
+        except Exception as exc:
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            _api_logger.error(
+                "http_request_error",
+                method=request.method,
+                path=request.url.path,
+                duration_ms=duration_ms,
+                request_id=request_id,
+                error=str(exc),
+            )
+            raise
+        finally:
+            clear_context()
 
     # Optionally stash injected clients on app.state for health/version probes
     # and for retrieval hydration fallback.

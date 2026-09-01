@@ -17,6 +17,8 @@ dependencies = [
     "google-cloud-storage>=2.19.0",
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
+    "structlog==24.4.0",
+    "python-json-logger==2.0.7",
 ]
 
 [project.optional-dependencies]
@@ -180,6 +182,14 @@ ignore_errors = true
 [[tool.mypy.overrides]]
 module = "aksantara.api.projection_routes"
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = "structlog.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pythonjsonlogger.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

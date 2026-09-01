@@ -19,7 +19,12 @@ from typing import Any
 from aksantara.domain.models import KBBIEntry
 from aksantara.embeddings.document import build_embedding_document
 
-logger = logging.getLogger(__name__)
+try:
+    from aksantara.logging import get_logger as _get_logger
+
+    logger: Any = _get_logger(__name__)
+except Exception:  # pragma: no cover
+    logger = logging.getLogger(__name__)
 
 DEFAULT_DISTANCE_THRESHOLD: float = 0.70
 DEFAULT_DISTANCE_RESULT_FIELD: str = "vector_distance"
@@ -255,14 +260,15 @@ class SemanticRetriever:
         try:
             qvec = self._embedder.embed_query(cleaned)
         except Exception as exc:
-            logger.warning("semantic embed_query failed for %r: %s", cleaned, exc)
+            logger.warning("semantic_embed_query_failed", query=cleaned, error=str(exc))
             return []
 
         if not isinstance(qvec, (list, tuple)) or len(qvec) != DEFAULT_DIMS:
             logger.warning(
-                "semantic query vector invalid length %s, expected %d",
-                len(qvec) if isinstance(qvec, (list, tuple)) else type(qvec).__name__,
-                DEFAULT_DIMS,
+                "semantic_query_vector_invalid",
+                actual_len=len(qvec) if isinstance(qvec, (list, tuple)) else -1,
+                expected_len=DEFAULT_DIMS,
+                actual_type=type(qvec).__name__,
             )
             return []
 
@@ -274,7 +280,7 @@ class SemanticRetriever:
                 distance_threshold=self._threshold,
             )
         except Exception as exc:
-            logger.warning("semantic find_nearest failed: %s", exc)
+            logger.warning("semantic_find_nearest_failed", error=str(exc))
             return []
         if not nearest:
             return []

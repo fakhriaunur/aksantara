@@ -17,7 +17,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, runtime_checkable
 
-logger = logging.getLogger(__name__)
+try:
+    from aksantara.logging import get_logger as _get_logger
+
+    logger: Any = _get_logger(__name__)
+except Exception:  # pragma: no cover - fallback for offline import
+    logger = logging.getLogger(__name__)
 
 TaskType = Literal[
     "RETRIEVAL_DOCUMENT",
@@ -43,7 +48,12 @@ def truncate_for_embedding(text: str, max_chars: int = MAX_CHARS_PER_REQUEST) ->
     if len(text) <= max_chars:
         return text
     truncated = text[:max_chars].rstrip()
-    logger.warning("vertex_truncate: %d -> %d chars", len(text), len(truncated))
+    logger.warning(
+        "vertex_truncate",
+        original_chars=len(text),
+        truncated_chars=len(truncated),
+        max_chars=max_chars,
+    )
     return truncated
 
 
@@ -113,7 +123,7 @@ class VertexEmbeddingClient:
                 values = list(values)[: self.dimensions]
             return list(values)
         except Exception as exc:
-            logger.warning("vertex embed fallback to hash: %s", exc)
+            logger.warning("vertex_embed_fallback", error=str(exc))
             return self._hash_vector(truncated)
 
     def embed_batch(
@@ -201,7 +211,7 @@ class VertexGeminiEmbedding:
             )
             return self._client
         except Exception as exc:
-            logger.warning("Vertex client init fallback to hash: %s", exc)
+            logger.warning("vertex_client_init_fallback", error=str(exc))
             return self._fallback
 
     def _with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -226,11 +236,11 @@ class VertexGeminiEmbedding:
                     raise
                 backoff = self._config.backoff_base_s * (2**attempt)
                 logger.warning(
-                    "vertex retry %d/%d backoff %.2fs: %s",
-                    attempt + 1,
-                    self._config.retries,
-                    backoff,
-                    exc,
+                    "vertex_retry",
+                    attempt=attempt + 1,
+                    max_retries=self._config.retries,
+                    backoff_s=backoff,
+                    error=str(exc),
                 )
                 time.sleep(backoff)
         if last_exc is not None:

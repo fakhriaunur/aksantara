@@ -28,7 +28,12 @@ from aksantara.embeddings.firestore_utils import (
     _wrap_vector,
 )
 
-logger = logging.getLogger(__name__)
+try:
+    from aksantara.logging import get_logger as _get_logger
+
+    logger: Any = _get_logger(__name__)
+except Exception:  # pragma: no cover
+    logger = logging.getLogger(__name__)
 
 __all__ = ["FirestoreVectorStore"]
 
@@ -84,7 +89,11 @@ class FirestoreVectorStore(EmbeddingStore):
     def _assert_record(self, record: VectorRecord) -> None:
         vec_len = len(record.vector_as_list())
         if vec_len not in (self.dimensions, DEFAULT_DIMS, 768) and vec_len != 0:
-            logger.warning("vector dims %d != expected %d", vec_len, self.dimensions)
+            logger.warning(
+                "vector_dimension_mismatch",
+                vector_len=vec_len,
+                expected_dimensions=self.dimensions,
+            )
 
     def put(self, record: VectorRecord) -> None:
         self._assert_record(record)
@@ -305,7 +314,9 @@ class FirestoreVectorStore(EmbeddingStore):
                 return tuples
             return results
         except Exception as exc:
-            logger.warning("firestore find_nearest error, falling back: %s", exc)
+            logger.warning(
+                "firestore_find_nearest_fallback", error=str(exc), limit=real_limit
+            )
             return self._fallback.find_nearest(
                 query_vector,
                 limit=real_limit,
