@@ -84,6 +84,14 @@ class CheckpointCreateRequest(BaseModel):
         default=None,
         description="Alias for barrier (caller-owned, process-scoped, local-only)",
     )
+    persistence_fault: str | dict[str, Any] | None = Field(
+        default=None,
+        description="Caller-owned, process-scoped, local-only persistence fault injection target: run, raw, canonical, checkpoint, cursor, combined_transaction, or *; phase via persistence_fault_phase; cannot target cloud/production",
+    )
+    persistence_fault_phase: str | None = Field(
+        default=None,
+        description="Persistence fault phase: before_write (no durable commit, 503) or durable_write_before_ack (ack lost, recoverable); local-only",
+    )
 
 
 class CheckpointResumeRequest(BaseModel):
@@ -118,6 +126,14 @@ class CheckpointResumeRequest(BaseModel):
     barrier_hold: float | None = Field(
         default=None,
         description="Seconds to hold at barrier during resume",
+    )
+    persistence_fault: str | dict[str, Any] | None = Field(
+        default=None,
+        description="Caller-owned, process-scoped, local-only persistence fault injection target for resume recovery test; phase via persistence_fault_phase",
+    )
+    persistence_fault_phase: str | None = Field(
+        default=None,
+        description="Persistence fault phase for resume: before_write or durable_write_before_ack; local-only",
     )
     mode: str = Field(
         default="local-fixture-only",
@@ -357,6 +373,8 @@ def create_checkpoint_router() -> APIRouter:
                 barrier=barrier,
                 barrier_hold=hold,
                 interrupt_after=interrupt_after,
+                persistence_fault=getattr(request, "persistence_fault", None),
+                fault_phase=getattr(request, "persistence_fault_phase", None),
             )
         except CheckpointError as exc:
             raise _error_response(exc) from exc
@@ -374,7 +392,8 @@ def create_checkpoint_router() -> APIRouter:
             "Verifies fingerprint drift: changed catalog/limit/pins return 409 blocked/conflict without mutating old state. "
             "Same tuple on completed is no-op. Reclaims lease with new generation and fences stale generation. "
             "Only published uncommitted/in-flight work (keys beyond cursor) may repeat; committed keys never repeat. "
-            "Supports caller-owned barrier controls for resumed window. Cannot target cloud/production."
+            "Supports caller-owned barrier and persistence-fault controls for resumed window. Cannot target cloud/production. "
+            "Persistence faults at run/raw/canonical/checkpoint/cursor boundaries return truthful recoverable or terminal states, preserve prior complete revisions, and never advance eligibility falsely; ambiguous acks never report completion; replay cannot repair."
         ),
     )
     def resume_run(
@@ -393,6 +412,8 @@ def create_checkpoint_router() -> APIRouter:
                 idempotency_key=request.idempotency_key,
                 barrier=barrier,
                 barrier_hold=hold,
+                persistence_fault=getattr(request, "persistence_fault", None),
+                fault_phase=getattr(request, "persistence_fault_phase", None),
             )
         except CheckpointError as exc:
             raise _error_response(exc) from exc

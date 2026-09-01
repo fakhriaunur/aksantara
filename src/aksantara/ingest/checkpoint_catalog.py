@@ -390,7 +390,7 @@ def _parse_source_ref(payload: object, stable_key: str) -> SourceRef:
     return source_ref
 
 
-def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, Any]:
+def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, Any]:  # noqa: C901
     if isinstance(payload, str):
         payload = {"adapter": "fixture", "path": payload}
     if not isinstance(payload, Mapping):
@@ -416,6 +416,17 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
             "raw_bytes",
             "content",
             "base64",
+            "retry_after",
+            "Retry-After",
+            "retryAfter",
+            "max_retries",
+            "maxRetries",
+            "attempt_sequence",
+            "attemptSequence",
+            "always_transient",
+            "timeout",
+            "fault",
+            "persistence_fault",
         },
         context="transport",
         details={"stable_key": stable_key},
@@ -569,6 +580,58 @@ def _transport_dict(payload: object, root: Path, stable_key: str) -> dict[str, A
             "successful fixture transport must bind path or immutable bytes",
             details={"stable_key": stable_key},
         )
+    # Preserve retry and fault injection fields for validator-driven tests
+    for key in (
+        "retry_after",
+        "Retry-After",
+        "retryAfter",
+        "max_retries",
+        "maxRetries",
+        "attempt_sequence",
+        "attemptSequence",
+        "always_transient",
+        "timeout",
+        "fault",
+        "persistence_fault",
+    ):
+        if key in payload:
+            result[key] = payload[key]
+    # Normalize aliases
+    if "retryAfter" in payload and "retry_after" not in result:
+        result["retry_after"] = payload["retryAfter"]
+    if "Retry-After" in payload and "retry_after" not in result:
+        result["retry_after"] = payload["Retry-After"]
+    if "maxRetries" in payload and "max_retries" not in result:
+        result["max_retries"] = payload["maxRetries"]
+    if "attemptSequence" in payload and "attempt_sequence" not in result:
+        result["attempt_sequence"] = payload["attemptSequence"]
+    # Validate max_retries if present
+    if "max_retries" in result:
+        mr = result["max_retries"]
+        if not isinstance(mr, int) or mr < 0 or mr > 10:
+            raise CatalogValidationError("transport.max_retries must be integer 0..10")
+    # Validate attempt_sequence if present
+    if "attempt_sequence" in result:
+        seq = result["attempt_sequence"]
+        if not isinstance(seq, list) or not seq:
+            raise CatalogValidationError(
+                "transport.attempt_sequence must be non-empty list"
+            )
+        for idx, item in enumerate(seq):
+            if isinstance(item, dict):
+                if "status" not in item:
+                    raise CatalogValidationError(
+                        f"attempt_sequence[{idx}].status is required"
+                    )
+                st = item["status"]
+                if not isinstance(st, int) or st < 100 or st > 599:
+                    raise CatalogValidationError(
+                        f"attempt_sequence[{idx}].status must be 100..599"
+                    )
+            elif not isinstance(item, int) or item < 100 or item > 599:
+                raise CatalogValidationError(
+                    f"attempt_sequence[{idx}] must be status int or object with status"
+                )
     return result
 
 

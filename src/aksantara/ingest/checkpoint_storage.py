@@ -65,6 +65,7 @@ def _write_state_json(path: Path, payload: Any, root: Path) -> None:
     artifacts.  Replacing only this small pointer-like document keeps status
     reads coherent without pretending that a mutable status path is history.
     """
+    _check_fault_before(root, path)
     data = _canonical_bytes(payload)
     try:
         path.resolve().relative_to(root)
@@ -78,6 +79,9 @@ def _write_state_json(path: Path, payload: Any, root: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary.write_bytes(data)
         os.replace(temporary, path)
+        _check_fault_after(root, path)
+    except CheckpointPersistenceError:
+        raise
     except OSError as exc:
         try:
             temporary.unlink(missing_ok=True)
@@ -90,6 +94,7 @@ def _write_state_json(path: Path, payload: Any, root: Path) -> None:
 
 
 def _write_immutable(path: Path, data: bytes, root: Path) -> None:
+    _check_fault_before(root, path)
     try:
         path.resolve().relative_to(root)
     except ValueError as exc:
@@ -112,11 +117,8 @@ def _write_immutable(path: Path, data: bytes, root: Path) -> None:
             temporary.unlink()
         temporary.write_bytes(data)
         os.replace(temporary, path)
+        _check_fault_after(root, path)
     except CheckpointPersistenceError:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise
     except OSError as exc:
         try:
@@ -236,11 +238,116 @@ def _check_fence(run_dir: Path, expected_generation: int) -> None:
         )
 
 
+_fault_injections: dict[str, dict[str, Any]] = {}
+
+
+def set_fault_injection(root: Path, spec: dict[str, Any] | None) -> None:
+    """Set caller-owned persistence fault injection for a root.
+
+    spec may contain: target (run|raw|canonical|checkpoint|cursor|*), phase
+    (before_write|durable_write_before_ack), count (how many injections), error
+    details.  None clears injection. Caller-owned, local-only, process-scoped.
+    """
+    key = str(Path(root).resolve())
+    if spec is None:
+        _fault_injections.pop(key, None)
+    else:
+        _fault_injections[key] = dict(spec)
+
+
+def _check_fault(root: Path, path: Path, *, phase: str = "before_write") -> None:
+    """Check fault injection for a write; raise if matched.
+
+    For durable_write_before_ack, the caller should have already written the
+    durable bytes before calling this to simulate ack loss.
+    """
+    key = str(Path(root).resolve())
+    spec = _fault_injections.get(key)
+    if not spec:
+        return
+    target = str(spec.get("target", "*"))
+    spec_phase = str(spec.get("phase", "before_write"))
+    if spec_phase != phase:
+        return
+    # Check target match: exact file name or substring of name, or "*" or run/raw/canonical/checkpoint/cursor boundaries
+    # For boundaries, match specific file patterns:
+    #   run -> request.json, preflight.json, lease.json, status.json initial
+    #   raw -> raw/<hash>.bin
+    #   canonical -> canonical/*.json
+    #   checkpoint -> checkpoint.json, outcomes.json, attempts.json, report.json
+    #   cursor -> status.json (cursor field)
+    name = path.name
+    if target != "*":
+        boundary_map = {
+            "run": {"request.json", "preflight.json", "lease.json"},
+            "raw": {"raw"},
+            "canonical": {"canonical"},
+            "checkpoint": {
+                "checkpoint.json",
+                "outcomes.json",
+                "attempts.json",
+                "report.json",
+            },
+            "cursor": {"status.json"},
+        }
+        if target in boundary_map:
+            allowed = boundary_map[target]
+            # For raw/canonical, check parent directory name
+            if target in {"raw", "canonical"}:
+                if (
+                    target not in str(path.parent.name)
+                    and name not in allowed
+                    and target not in name
+                ):
+                    return
+            else:
+                if name not in allowed and target not in name:
+                    return
+        elif target not in name:
+            return
+    # Consume count if limited
+    remaining = spec.get("remaining", spec.get("count", 1))
+    try:
+        remaining = int(remaining)
+    except Exception:
+        remaining = 1
+    if remaining <= 0:
+        _fault_injections.pop(key, None)
+        return
+    spec["remaining"] = remaining - 1
+    if spec["remaining"] <= 0:
+        # Keep spec until cleared, but no more faults
+        pass
+    # Simulate fault: raise persistence error with fault details
+    raise CheckpointPersistenceError(
+        "injected persistence fault for caller-owned recovery test",
+        details={
+            "fault_target": target,
+            "fault_phase": phase,
+            "path": str(path),
+            "injected": True,
+            "recoverable": True,
+            "requires_resume": True,
+        },
+    )
+
+
+def _check_fault_before(root: Path, path: Path) -> None:
+    _check_fault(root, path, phase="before_write")
+
+
+def _check_fault_after(root: Path, path: Path) -> None:
+    _check_fault(root, path, phase="durable_write_before_ack")
+
+
 __all__ = [
     "_acquire_file_lock",
     "_barrier_path",
     "_canonical_bytes",
+    "_check_fault_after",
+    "_check_fault_before",
     "_check_fence",
+    "_fault_injections",
     "_hash_payload",
     "_lease_path",
     "_read_json",
@@ -252,4 +359,5 @@ __all__ = [
     "_write_json",
     "_write_lease",
     "_write_state_json",
+    "set_fault_injection",
 ]

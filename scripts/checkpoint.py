@@ -98,6 +98,15 @@ def _common_parser() -> argparse.ArgumentParser:
         help="Alias for --barrier (caller-owned fault control, local-only)",
     )
     common.add_argument(
+        "--persistence-fault",
+        help="Caller-owned persistence fault injection target: run, raw, canonical, checkpoint, cursor, combined_transaction, or *; local-only, process-scoped",
+    )
+    common.add_argument(
+        "--persistence-fault-phase",
+        choices=("before_write", "durable_write_before_ack"),
+        help="Persistence fault phase: before_write (no durable commit) or durable_write_before_ack (ack lost, recoverable)",
+    )
+    common.add_argument(
         "--json",
         action="store_true",
         help="Emit one machine-readable JSON object instead of human text",
@@ -263,6 +272,8 @@ def _operation(args: argparse.Namespace) -> Any:
             barrier=barrier,
             barrier_hold=barrier_hold,
             interrupt_after=interrupt_after,
+            persistence_fault=getattr(args, "persistence_fault", None),
+            fault_phase=getattr(args, "persistence_fault_phase", None),
         ).to_dict()
     if operation == "resume":
         if not args.run_id:
@@ -293,6 +304,8 @@ def _operation(args: argparse.Namespace) -> Any:
             idempotency_key=args.idempotency_key,
             barrier=barrier,
             barrier_hold=barrier_hold,
+            persistence_fault=getattr(args, "persistence_fault", None),
+            fault_phase=getattr(args, "persistence_fault_phase", None),
         ).to_dict()
     if operation == "lease":
         if not args.run_id:

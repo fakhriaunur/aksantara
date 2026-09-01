@@ -13,6 +13,7 @@ callers that need a deterministic core without starting the API.
 
 from __future__ import annotations
 
+import json
 import threading
 import uuid
 from collections.abc import Mapping
@@ -38,6 +39,7 @@ from aksantara.ingest.checkpoint_storage import (
     _write_json,
     _write_lease,
     _write_state_json,
+    set_fault_injection,
 )
 from aksantara.ingest.checkpoint_types import (
     _BARRIER_PHASES,
@@ -459,12 +461,109 @@ class CheckpointDriver(
                 "same_tuple_completed": "no-op with no work, writes, reopening, or duplicate candidate",
                 "drift": "non-mutating conflict or persisted blocked with resume prohibition; never silently adopts new rules or mutates old state",
             },
+            "retry": {
+                "max_retries": 3,
+                "initial_attempt_numbering": 1,
+                "cumulative_bound": "each source key has at most max_retries+1 transport requests across restarts; validation attempts are separate",
+                "terminal_mappings": {
+                    "retryable": "429 and 500-599 with retries remaining; becomes failed when exhausted",
+                    "permanent": "400-428 and 430-499 are non-retryable failed",
+                    "deterministic": "parse/schema/hash/authority failures never enter transport retry",
+                },
+                "delay_formula": "exponential backoff base_delay*2^(attempt) capped at max_delay",
+                "base_delay_seconds": 0.5,
+                "max_delay_seconds": 8.0,
+                "deadline": "bounded by max_retries not wall-clock; no unbounded delay",
+                "retry_after_handling": {
+                    "valid_integer_seconds": "delay = max(backoff, Retry-After seconds)",
+                    "valid_http_date": "delay = max(backoff, seconds until Retry-After date)",
+                    "invalid_negative": "invalid or negative Retry-After is ignored and backoff is used",
+                    "negative_values": "negative Retry-After treated as invalid",
+                    "date_past": "past date treated as 0 extra delay",
+                },
+                "jitter": {
+                    "range": "0-10% added to backoff to avoid thundering herd",
+                    "deterministic": False,
+                    "applies_to": "backoff delay only, not Retry-After override",
+                },
+                "per_attempt_fields": [
+                    "attempt_number",
+                    "class",
+                    "retry_decision",
+                    "delay_seconds",
+                    "scheduled_at",
+                    "retry_after_raw",
+                ],
+                "retryable_to_success": "transient then success is accepted within bounds",
+                "exhaustion": "terminal failed when retries exhausted; preserves cursor/history and is non-promotable",
+                "restart_cumulative": "budget does not reset on resume; cumulative count includes pre-restart attempts",
+                "source_order": "documented in contract and per-attempt history",
+            },
             "outcomes": {
                 "accepted": "parsed and schema/authority validation succeeded; no candidate/pointer write",
-                "rejected": "deterministic parse/schema/hash/input failure",
-                "quarantined": "authority or review-required failure",
-                "retryable": "transport status 429/5xx; not eligible",
-                "failed": "permanent transport or durable processing failure",
+                "rejected": "deterministic parse/schema/hash/input failure; never retries",
+                "quarantined": "authority or review-required failure; never retries",
+                "retryable": "transport status 429/5xx with retries remaining; not eligible, may become failed when exhausted",
+                "failed": "permanent transport 404/4xx or exhausted retryable; never retries further",
+            },
+            "persistence_fault": {
+                "boundaries": [
+                    "run",
+                    "raw",
+                    "canonical",
+                    "checkpoint",
+                    "cursor",
+                    "checkpoint_before_cursor",
+                    "combined_transaction",
+                ],
+                "phases": ["before_write", "durable_write_before_ack"],
+                "injection": "caller-owned, process-scoped, local-only via --persistence-fault or fault_plan; cannot target cloud/production",
+                "before_write": "operation returns 503 or recoverable state keyed to run/operation/phase without advancing cursor or eligibility",
+                "durable_write_before_ack": "durable bytes exist but ack is lost; operation returns recoverable not success; ambiguous ack never reports completion; resume converges once",
+                "run_creation": "no partial run or request-bound failed run as specified; identity preserved",
+                "cursor_invariant": "cursor never moves past complete revision; attempted work not terminal without committed outcome; candidate never eligible when fault occurs",
+                "orphan": "unacknowledged writes are orphaned and explicitly non-promotable; no manual storage repair or replay-as-repair",
+                "recovery": "resume with same tuple converges once, retains errors/versioned history, rejects stale generations, preserves prior complete revisions",
+                "replay_is_not_repair": "read-only replay cannot commit, advance, reopen, or substitute for recovery evidence",
+            },
+            "equivalence": {
+                "interrupted_vs_uninterrupted": "selected keys, fingerprints, canonical/raw hashes, outcomes/reasons, exclusions, candidate bytes/self-hash, release eligibility, API joins, projection bytes/hashes are equal after excluding only documented volatile fields",
+                "volatile_fields": [
+                    "run_id",
+                    "request_id",
+                    "operation_id",
+                    "process_times",
+                    "lease_owner_pid",
+                    "heartbeat",
+                    "expiry",
+                    "in_flight set",
+                ],
+                "isolated_roots": "no mutable pointer/state root is shared between compared runs",
+                "committed_not_reprocessed": "no committed key is reprocessed; only published in-flight set may repeat",
+            },
+            "replay": {
+                "scope": "public replay covers every accepted row read-only; hashes bytes before parsing; rejects changed bytes/pins without mutating recovery state",
+                "hash_before_parse": True,
+                "changed_input": "non-success or deterministic:false with authoritative state unchanged",
+                "writes": 0,
+                "coverage": "complete accepted-ID coverage; subset is sample-level not complete",
+            },
+            "cleanup": {
+                "after": [
+                    "normal completion",
+                    "interruption",
+                    "abrupt termination",
+                    "retry exhaustion",
+                    "validation failure",
+                    "fingerprint block",
+                    "persistence fault",
+                    "successful resume",
+                ],
+                "owned_state": "no owned worker/PID/lock remains, or documented expiry/fencing makes it recoverable without manual deletion",
+                "durable_evidence": "run/checkpoint/attempt/error, raw, canonical, review, candidate evidence remains readable",
+                "only_temporary": "cleanup only removes run-owned temporary staging/locks/processes; historical evidence, vectors, pointers, another owner's lease remain",
+                "stale_fence": "stale worker cannot write after reclaim",
+                "path_isolation": "cleanup never crosses caller root",
             },
             "error_mapping": {
                 "invalid_catalog_or_limit": "422 / CLI exit 2, no run or source attempt",
@@ -636,6 +735,8 @@ class CheckpointDriver(
         barrier: str | None = None,
         barrier_hold: float | None = None,
         interrupt_after: int | None = None,
+        persistence_fault: dict[str, Any] | str | None = None,
+        fault_phase: str | None = None,
         _cloud_target: bool = False,
     ) -> RunResult:
         """Create and synchronously execute one durable local checkpoint with lease, barrier, and concurrency."""
@@ -653,6 +754,48 @@ class CheckpointDriver(
         if barrier_hold is not None and barrier_hold < 0:
             raise CatalogValidationError("barrier hold must be non-negative")
         hold = float(barrier_hold or 0)
+        # Extract caller-owned persistence fault injection (local-only)
+        fault_spec: dict[str, Any] | None = None
+        # persistence_fault may be passed directly or via catalog's fault_injection
+        if persistence_fault is not None:
+            if isinstance(persistence_fault, str):
+                fault_spec = {
+                    "target": persistence_fault,
+                    "phase": fault_phase or "before_write",
+                    "count": 1,
+                }
+            elif isinstance(persistence_fault, dict):
+                fault_spec = dict(persistence_fault)
+                if fault_phase:
+                    fault_spec["phase"] = fault_phase
+        else:
+            catalog_fault = (
+                catalog.get("fault_injection")
+                or catalog.get("persistence_fault")
+                or catalog.get("fault_plan")
+            )
+            if isinstance(catalog_fault, dict):
+                fault_spec = dict(catalog_fault)
+            elif isinstance(catalog_fault, str):
+                fault_spec = {
+                    "target": catalog_fault,
+                    "phase": "before_write",
+                    "count": 1,
+                }
+        if fault_spec and _cloud_target:
+            raise CatalogValidationError(
+                "persistence fault controls cannot target cloud/production state"
+            )
+        if fault_spec:
+            phase = str(fault_spec.get("phase", "before_write"))
+            if phase not in {"before_write", "durable_write_before_ack"}:
+                raise CatalogValidationError(
+                    "fault phase must be before_write or durable_write_before_ack"
+                )
+            # Allow any substring match, but validate phase
+            set_fault_injection(self.root, fault_spec)
+        else:
+            set_fault_injection(self.root, None)
         # Preflight and idempotency validation before acquiring lock to avoid
         # creating .aksantara on invalid input (validator expects no state).
         preflight = self.preflight(catalog, limit=limit)
@@ -714,15 +857,54 @@ class CheckpointDriver(
                     )
                     return self._load_result(run_id)
 
-                self._create_run(preflight, run_id, effective_key, catalog)
-                result = self._execute(
-                    preflight,
-                    run_id,
-                    effective_key,
-                    barrier_phase=barrier,
-                    barrier_hold_seconds=hold,
-                    interrupt_after=interrupt_after,
-                )
+                try:
+                    self._create_run(preflight, run_id, effective_key, catalog)
+                except CheckpointPersistenceError as exc:
+                    # Run creation fault: preserve no partial run or request-bound failed state
+                    # If fault is before_write, clean partial dir so next attempt can succeed
+                    if not (run_dir / "request.json").exists():
+                        try:
+                            import shutil
+
+                            shutil.rmtree(run_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                    else:
+                        # Durable write before ack left request.json durable but ack lost
+                        # Keep it as recoverable state keyed to run/operation/phase
+                        try:
+                            fault_marker = run_dir / "fault-recoverable.json"
+                            fault_marker.write_text(
+                                json.dumps(
+                                    {
+                                        "run_id": run_id,
+                                        "phase": getattr(exc, "details", {}).get(
+                                            "fault_phase", "before_write"
+                                        ),
+                                        "recoverable": True,
+                                        "requires_resume": True,
+                                    }
+                                ),
+                                encoding="utf-8",
+                            )
+                        except Exception:
+                            pass
+                    set_fault_injection(self.root, None)
+                    raise
+                try:
+                    result = self._execute(
+                        preflight,
+                        run_id,
+                        effective_key,
+                        barrier_phase=barrier,
+                        barrier_hold_seconds=hold,
+                        interrupt_after=interrupt_after,
+                    )
+                except CheckpointPersistenceError:
+                    set_fault_injection(self.root, None)
+                    raise
+                finally:
+                    set_fault_injection(self.root, None)
                 self._bind_idempotency(
                     effective_key,
                     run_id,
@@ -745,6 +927,8 @@ class CheckpointDriver(
         idempotency_key: str | None = None,
         barrier: str | None = None,
         barrier_hold: float | None = None,
+        persistence_fault: dict[str, Any] | str | None = None,
+        fault_phase: str | None = None,
     ) -> RunResult:
         """Resume an interrupted run with fencing, drift checks, and concurrency."""
         if barrier is not None and barrier not in _BARRIER_PHASES:
@@ -752,6 +936,42 @@ class CheckpointDriver(
                 "unsupported barrier phase",
                 details={"phase": barrier},
             )
+        # Handle persistence fault injection for resume
+        fault_spec: dict[str, Any] | None = None
+        if persistence_fault is not None:
+            if isinstance(persistence_fault, str):
+                fault_spec = {
+                    "target": persistence_fault,
+                    "phase": fault_phase or "before_write",
+                    "count": 1,
+                }
+            elif isinstance(persistence_fault, dict):
+                fault_spec = dict(persistence_fault)
+                if fault_phase:
+                    fault_spec["phase"] = fault_phase
+            if fault_spec:
+                set_fault_injection(self.root, fault_spec)
+            else:
+                set_fault_injection(self.root, None)
+        else:
+            # Also check catalog fault_injection
+            if catalog is not None:
+                catalog_fault = (
+                    catalog.get("fault_injection")
+                    or catalog.get("persistence_fault")
+                    or catalog.get("fault_plan")
+                )
+                if isinstance(catalog_fault, dict):
+                    set_fault_injection(self.root, dict(catalog_fault))
+                elif isinstance(catalog_fault, str):
+                    set_fault_injection(
+                        self.root,
+                        {"target": catalog_fault, "phase": "before_write", "count": 1},
+                    )
+                else:
+                    set_fault_injection(self.root, None)
+            else:
+                set_fault_injection(self.root, None)
         # Validate catalog before lock to avoid creating state on invalid input
         preflight_early = None
         if catalog is not None:
@@ -935,29 +1155,46 @@ class CheckpointDriver(
                 }
                 _write_lease(run_dir, new_lease, self.root)
                 # Now continue from cursor
-                # Load existing outcomes
-                outcomes_payload = _read_json(run_dir / "outcomes.json")
-                attempts_payload = _read_json(run_dir / "attempts.json")
-                existing_outcomes = list(outcomes_payload.get("outcomes", []))
-                existing_logical = list(attempts_payload.get("attempts", []))
-                existing_physical = list(attempts_payload.get("physical_attempts", []))
+                # Load existing outcomes (tolerant after persistence fault before any commit)
+                try:
+                    outcomes_payload = _read_json(run_dir / "outcomes.json")
+                    existing_outcomes = list(outcomes_payload.get("outcomes", []))
+                except CheckpointNotFoundError:
+                    existing_outcomes = []
+                try:
+                    attempts_payload = _read_json(run_dir / "attempts.json")
+                    existing_logical = list(attempts_payload.get("attempts", []))
+                    existing_physical = list(
+                        attempts_payload.get("physical_attempts", [])
+                    )
+                except CheckpointNotFoundError:
+                    existing_logical = []
+                    existing_physical = []
                 # Determine idempotency key for report
                 idem_key = idempotency_key or f"run:{preflight.run_fingerprint}"
                 try:
                     idem_key = self._validate_idempotency_key(idem_key)
                 except CheckpointConflictError:
                     idem_key = f"run:{preflight.run_fingerprint}"
-                result = self._resume_incremental(
-                    preflight,
-                    run_id,
-                    idem_key,
-                    existing_outcomes,
-                    existing_logical,
-                    existing_physical,
-                    new_gen,
-                )
+                try:
+                    result = self._resume_incremental(
+                        preflight,
+                        run_id,
+                        idem_key,
+                        existing_outcomes,
+                        existing_logical,
+                        existing_physical,
+                        new_gen,
+                    )
+                except CheckpointPersistenceError:
+                    set_fault_injection(self.root, None)
+                    raise
+                finally:
+                    set_fault_injection(self.root, None)
                 return result
         finally:
+            # Ensure fault injection is cleared after resume attempt
+            set_fault_injection(self.root, None)
             if lock_handle is not None:
                 try:
                     _release_file_lock(lock_handle)
