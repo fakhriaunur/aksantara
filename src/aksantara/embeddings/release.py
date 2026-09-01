@@ -221,6 +221,14 @@ def load_manifest(root: Path, version: str) -> dict[str, Any]:
 def verify_release(root: Path, version: str) -> dict[str, Any]:
     """Strict verification without side effects; fails closed."""
     root = Path(root).expanduser().resolve()
+    # unavailable store check
+    if not root.exists():
+        return {
+            "valid": False,
+            "eligible": False,
+            "reason": "store unavailable",
+            "code": "unavailable",
+        }
     manifest_path = root / "releases" / f"{version}.json"
     if not manifest_path.exists():
         return {"valid": False, "eligible": False, "reason": "manifest not found"}
@@ -232,6 +240,24 @@ def verify_release(root: Path, version: str) -> dict[str, Any]:
             "eligible": False,
             "reason": f"manifest parse failed: {exc}",
         }
+    # conflicted/quarantined check
+    if (
+        manifest.get("conflicts")
+        or manifest.get("quarantine")
+        or manifest.get("blocked_ids")
+    ):
+        blocked = (
+            manifest.get("conflicts")
+            or manifest.get("quarantine")
+            or manifest.get("blocked_ids")
+        )
+        if blocked:
+            return {
+                "valid": False,
+                "eligible": False,
+                "reason": "release blocked by conflict/quarantine",
+                "detail": blocked,
+            }
     # self-hash check
     stored = manifest.get("manifestHash") or manifest.get("manifest_hash")
     recomputed = hashlib.sha256(
@@ -251,19 +277,62 @@ def verify_release(root: Path, version: str) -> dict[str, Any]:
     # canonical/raw join check
     entries_count = manifest.get("entries_count", 0)
     artifact_hashes = manifest.get("artifactHashes", {})
+    # support both camel and snake but spec uses artifactHashes dict
+    if isinstance(artifact_hashes, list):
+        return {
+            "valid": False,
+            "eligible": False,
+            "reason": "artifactHashes must be dict with per-entry hashes",
+        }
     if not isinstance(artifact_hashes, dict) or len(artifact_hashes) != entries_count:
         return {
             "valid": False,
             "eligible": False,
             "reason": "artifactHashes incomplete",
         }
+    canonical_hashes = (
+        manifest.get("canonicalHashes") or manifest.get("canonical_hashes") or {}
+    )
     vectors_dir = root / "vectors" / version
     if not vectors_dir.exists():
-        return {"valid": False, "eligible": False, "reason": "vectors missing"}
+        return {
+            "valid": False,
+            "eligible": False,
+            "reason": "vectors missing",
+            "code": "unavailable",
+        }
     vector_files = list(vectors_dir.glob("*.json"))
-    vector_ids = {p.stem.split("_")[0] for p in vector_files}
+    # duplicate detection: file count vs unique entry_ids
+    seen_ids: dict[str, int] = {}
+    for p in vector_files:
+        eid = p.stem.split("_")[0]
+        seen_ids[eid] = seen_ids.get(eid, 0) + 1
+    dups = [k for k, v in seen_ids.items() if v > 1]
+    if dups:
+        return {
+            "valid": False,
+            "eligible": False,
+            "reason": f"duplicate vector for {dups}",
+        }
+    if len(vector_files) != len(seen_ids):
+        return {"valid": False, "eligible": False, "reason": "duplicate vector doc_ids"}
+    vector_ids = set(seen_ids.keys())
     expected_ids = set(artifact_hashes.keys())
     if vector_ids != expected_ids:
+        missing = sorted(expected_ids - vector_ids)
+        extra = sorted(vector_ids - expected_ids)
+        if missing:
+            return {
+                "valid": False,
+                "eligible": False,
+                "reason": f"missing vectors for {missing}",
+            }
+        if extra:
+            return {
+                "valid": False,
+                "eligible": False,
+                "reason": f"extra vectors for {extra}",
+            }
         return {
             "valid": False,
             "eligible": False,
@@ -353,6 +422,33 @@ def verify_release(root: Path, version: str) -> dict[str, Any]:
                 "eligible": False,
                 "reason": f"raw hash mismatch for {entry_id}",
             }
+        # stale canonical check if manifest carries canonicalHashes
+        if isinstance(canonical_hashes, dict) and entry_id in canonical_hashes:
+            expected_cch = canonical_hashes[entry_id]
+            actual_cch = (
+                data.get("canonical_content_hash")
+                or data.get("metadata", {}).get("canonical_content_hash")
+                or data.get("canonical_hash")
+                or ""
+            )
+            if actual_cch and actual_cch != expected_cch:
+                return {
+                    "valid": False,
+                    "eligible": False,
+                    "reason": f"stale canonical hash for {entry_id}",
+                }
+    # check store availability: ensure canonical files readable if present
+    canonical_dir = root / "canonical" / version
+    if canonical_dir.exists():
+        for eid in expected_ids:
+            cf = list(canonical_dir.glob(f"{eid}*.json"))
+            if not cf:
+                # missing canonical is also tampered/missing
+                return {
+                    "valid": False,
+                    "eligible": False,
+                    "reason": f"canonical missing for {eid}",
+                }
     return {
         "valid": True,
         "eligible": True,

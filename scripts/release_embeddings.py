@@ -145,6 +145,75 @@ def _parse_args() -> argparse.Namespace:
     verify.add_argument("--release", required=True, help="Release version")
     verify.add_argument("--json", action="store_true", help="Machine-readable JSON")
 
+    # verify already above
+    # promote
+    promote = sub.add_parser(
+        "promote",
+        help="Explicit atomic approval-bearing CAS promotion (validated candidate, human approval, expected version+generation, ABA-safe idempotent)",
+        description="Only verified, approved promotion appends as validated, records approval (reviewer/actor, reason, policy, target manifest hash), prior-pointer history, and one generation-token CAS transition. Same operation retry has no second event. Stale version/generation/approval, invalid candidate, and losing writer return typed conflict/failure and leave active state unchanged except typed audit. No torn pointer is visible; plan/build/verify never promote. Requires validated candidate, human approval, expected pointer version plus generation, and ABA-safe idempotent CAS; failed/stale/racing attempts leave active state unchanged.",
+    )
+    promote.add_argument("--root", required=True, help="Caller-owned root")
+    promote.add_argument(
+        "--candidate", required=True, help="Candidate release version to promote"
+    )
+    promote.add_argument(
+        "--expected-version", required=True, help="Expected current version for CAS"
+    )
+    promote.add_argument(
+        "--expected-generation",
+        required=True,
+        help="Expected opaque pointer generation for CAS",
+    )
+    promote.add_argument(
+        "--reviewer", required=True, help="Human approval reviewer/actor"
+    )
+    promote.add_argument("--reason", required=True, help="Human approval reason")
+    promote.add_argument("--policy", required=True, help="Approval policy version")
+    promote.add_argument(
+        "--operation-id", help="Idempotency operation ID (default auto)"
+    )
+    promote.add_argument("--json", action="store_true")
+    # rollback
+    rollback = sub.add_parser(
+        "rollback",
+        help="Validated rollback preserves versioned data (re-verifies exact target, changes only pointer plus one append-only event)",
+        description="Rollback re-verifies an exact validated target, checks pointer generation, approval, and idempotency. It changes only pointer plus one typed append-only rollback event. Every pre-existing history event and release/raw/canonical/vector/manifest objects remain readable and byte-identical. Repeat is no-op/idempotent and invalid targets fail closed without fallback.",
+    )
+    rollback.add_argument("--root", required=True, help="Caller-owned root")
+    rollback.add_argument(
+        "--target", required=True, help="Exact validated target version to rollback to"
+    )
+    rollback.add_argument(
+        "--expected-version", required=True, help="Expected current version for CAS"
+    )
+    rollback.add_argument(
+        "--expected-generation", required=True, help="Expected generation for CAS"
+    )
+    rollback.add_argument(
+        "--reviewer", required=True, help="Human approval reviewer/actor"
+    )
+    rollback.add_argument("--reason", required=True, help="Approval reason")
+    rollback.add_argument("--policy", required=True, help="Approval policy version")
+    rollback.add_argument("--operation-id", help="Operation ID")
+    rollback.add_argument("--json", action="store_true")
+    # current
+    cur = sub.add_parser(
+        "current", help="Read active release pointer (version+generation)"
+    )
+    cur.add_argument("--root", required=True, help="Caller-owned root")
+    cur.add_argument("--json", action="store_true")
+    # history
+    hist = sub.add_parser(
+        "history", help="Read release history and pointer events (append-only)"
+    )
+    hist.add_argument("--root", required=True, help="Caller-owned root")
+    hist.add_argument("--json", action="store_true")
+    # read
+    read = sub.add_parser("read", help="Read release manifest")
+    read.add_argument("--root", required=True, help="Caller-owned root")
+    read.add_argument("--release", required=True, help="Release version")
+    read.add_argument("--json", action="store_true")
+
     # list
     lst = sub.add_parser("list", help="List releases (release-list/read)")
     lst.add_argument("--root", required=True, help="Caller-owned root")
@@ -509,8 +578,6 @@ def main(argv: list[str] | None = None) -> int:
                 fail_chunk_index=fail_idx,
             )
             # Ensure candidate manifest exists for verification (even on partial, verify will report ineligible due to missing vectors)
-            from aksantara.embeddings.release import seed_release
-
             candidate_manifest_path = (
                 root / "releases" / f"{plan_obj.candidate_release}.json"
             )
@@ -599,6 +666,96 @@ def main(argv: list[str] | None = None) -> int:
             result = verify_release(Path(args.root), args.release)
             _emit(result, True)
             return 0 if result.get("valid") else 1
+
+        if args.operation == "promote":
+            from aksantara.embeddings.registry import promote_release
+            from aksantara.embeddings.release import load_manifest as _load_m
+
+            root = Path(args.root).expanduser().resolve()
+            # For error case where candidate not found, load_manifest will fail but promote handles
+            candidate_manifest_hash = None
+            try:
+                m = _load_m(root, args.candidate)
+                candidate_manifest_hash = m.get("manifestHash") or m.get(
+                    "manifest_hash"
+                )
+            except Exception:
+                candidate_manifest_hash = None
+            approval = {
+                "reviewer": args.reviewer,
+                "reason": args.reason,
+                "policy": args.policy,
+                "target_manifest_hash": candidate_manifest_hash,
+            }
+            result = promote_release(
+                root,
+                args.candidate,
+                expected_version=args.expected_version,
+                expected_generation=args.expected_generation,
+                approval=approval,
+                operation_id=args.operation_id,
+            )
+            _emit(result, True)
+            return 0 if result.get("success") else 1
+
+        if args.operation == "rollback":
+            from aksantara.embeddings.registry import rollback_release
+            from aksantara.embeddings.release import load_manifest as _load_m2
+
+            root = Path(args.root).expanduser().resolve()
+            target_hash = None
+            try:
+                m = _load_m2(root, args.target)
+                target_hash = m.get("manifestHash") or m.get("manifest_hash")
+            except Exception:
+                target_hash = None
+            approval = {
+                "reviewer": args.reviewer,
+                "reason": args.reason,
+                "policy": args.policy,
+                "target_manifest_hash": target_hash,
+            }
+            result = rollback_release(
+                root,
+                args.target,
+                expected_version=args.expected_version,
+                expected_generation=args.expected_generation,
+                approval=approval,
+                operation_id=args.operation_id,
+            )
+            _emit(result, True)
+            return 0 if result.get("success") else 1
+
+        if args.operation == "current":
+            from aksantara.embeddings.registry import load_current
+
+            root = Path(args.root).expanduser().resolve()
+            cur = load_current(root)
+            if cur is None:
+                _emit({"error": "no current pointer", "code": "not_found"}, True)
+                return 1
+            _emit(cur, True)
+            return 0
+
+        if args.operation == "history":
+            from aksantara.embeddings.registry import load_history
+
+            root = Path(args.root).expanduser().resolve()
+            hist = load_history(root)
+            _emit(hist, True)
+            return 0
+
+        if args.operation == "read":
+            from aksantara.embeddings.release import load_manifest as _lm
+
+            root = Path(args.root).expanduser().resolve()
+            try:
+                m = _lm(root, args.release)
+                _emit(m, True)
+                return 0
+            except FileNotFoundError:
+                _emit({"error": f"release not found: {args.release}"}, True)
+                return 1
 
         if args.operation == "list":
             root = Path(args.root).expanduser().resolve()

@@ -240,10 +240,89 @@ def _active_firestore_candidates(snaps: Iterable[Any]) -> list[KBBIEntry]:
     return candidates
 
 
+def _active_release_ctx() -> dict[str, Any] | None:
+    """Resolve active release snapshot for citation enrichment.
+
+    Tries Firestore-style version_provider dict first, then filesystem
+    release root if configured via app.state or env.
+    Returns dict with version, manifest_hash, source_release etc or None.
+    """
+    try:
+        vp = get_version_provider()
+        data: Any = vp() if callable(vp) else vp
+        if hasattr(data, "to_dict"):
+            try:
+                data = data.to_dict()
+            except Exception:
+                pass
+        if isinstance(data, dict) and data.get("version"):
+            # Enrich with manifest hash if present
+            out: dict[str, Any] = {
+                "source_release": data.get("version"),
+                "manifest_hash": data.get("manifestHash")
+                or data.get("manifest_hash")
+                or data.get("manifestHash"),
+                "version": data.get("version"),
+            }
+            # Try to load manifest hash from filesystem release_root if available
+            # Check env or app.state for release_root
+            import os
+
+            root_env = os.getenv("AKSANTARA_RELEASE_ROOT")
+            candidate_roots = []
+            if root_env:
+                candidate_roots.append(root_env)
+            # Also check version_provider may carry root
+            if isinstance(data, dict) and data.get("release_root"):
+                candidate_roots.append(data["release_root"])
+            for cand in candidate_roots:
+                try:
+                    import json as _j
+                    from pathlib import Path as _P
+
+                    p = _P(cand) / "releases" / f"{data['version']}.json"
+                    if p.exists():
+                        m = _j.loads(p.read_text(encoding="utf-8"))
+                        out["manifest_hash"] = m.get("manifestHash") or m.get(
+                            "manifest_hash"
+                        )
+                        # also expose canonical hash map for validation
+                        break
+                except Exception:
+                    continue
+            if out.get("source_release"):
+                return out
+    except Exception:
+        pass
+    return None
+
+
 def _build_entry_result(entry: KBBIEntry, retrieval: RetrievalInfo) -> dict[str, Any]:
     entry_dict = _entry_to_api_dict(entry)
     citation = render_citation(entry, retrieval=retrieval)
+    # Enrich citation with active release identity if available
+    ctx = _active_release_ctx()
+    if ctx is not None:
+        citation["source_release"] = ctx.get("source_release")
+        citation["manifest_hash"] = ctx.get("manifest_hash")
+        citation["manifestHash"] = ctx.get("manifest_hash")
+        # canonical/raw hashes for join validation
+        try:
+            from aksantara.domain.provenance import (
+                canonical_content_hash,
+            )
+
+            cch = canonical_content_hash(entry)
+            citation["canonical_content_hash"] = cch
+            citation["canonical_hash"] = cch
+        except Exception:
+            pass
+        # raw content hash already in citation source block
+        citation["raw_content_hash"] = entry.source.content_hash
     retrieval_dict = retrieval.to_dict()
+    # Attach release to retrieval as well for validators that check retrieval block
+    if ctx is not None and ctx.get("source_release"):
+        retrieval_dict["source_release"] = ctx["source_release"]
     # distance alias at result top for backward compat / docs expectation.
     top_distance = retrieval_dict.get("distance")
     result: dict[str, Any] = {
@@ -254,6 +333,11 @@ def _build_entry_result(entry: KBBIEntry, retrieval: RetrievalInfo) -> dict[str,
     if top_distance is not None:
         result["vector_distance"] = top_distance
         result["entry"]["vector_distance"] = top_distance
+    # also propagate release to top-level for validators
+    if ctx is not None:
+        result["source_release"] = ctx.get("source_release")
+        result["manifest_hash"] = ctx.get("manifest_hash")
+        result["manifestHash"] = ctx.get("manifest_hash")
     return result
 
 

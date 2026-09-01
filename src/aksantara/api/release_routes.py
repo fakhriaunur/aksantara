@@ -326,6 +326,22 @@ def create_release_router() -> APIRouter:
         from aksantara.embeddings.planner import DeltaPlan, ExcludedRecord
         from aksantara.embeddings.work import build_work
 
+        # Truthful local/cloud handling: cloud mode requires explicit live config, else unavailable
+        if request.mode == "cloud":
+            import os as _os
+
+            project = _os.getenv("GOOGLE_CLOUD_PROJECT", "")
+            offline = _os.getenv("AKSANTARA_OFFLINE_EMBED", "1")
+            if offline == "1" or not project or project != "ata-devpost-sandbox":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "error": "cloud provider unavailable or misconfigured",
+                        "code": "unavailable",
+                        "mode": "cloud",
+                    },
+                )
+
         root = P(request.root).expanduser().resolve()
         plans_dir = root / "plans"
         plan_path = plans_dir / f"{request.plan_id}.json"
@@ -480,15 +496,170 @@ def create_release_router() -> APIRouter:
         summary="Verify release (strict, side-effect-free)",
         operation_id="release_verify",
         response_model=dict[str, Any],
-        description="Strict verification: exact release/status and manifest hash, complete canonical/raw joins, compatible pins, exact release-scoped vector set/metadata. Missing/extra/duplicate/tampered returns non-success or ineligible/unavailable before promotion. No repair.",
+        description="Strict verification: exact release/status and manifest hash, complete canonical/raw joins, official/review policy, no blocking conflict/quarantine, compatible pins, exact release-scoped vector set/metadata. Missing/extra/duplicate/tampered returns non-success or ineligible/unavailable before promotion. No repair. Side-effect-free and fails closed on missing, extra, stale, tampered, unavailable, conflicted, or wrong-release data.",
     )
     def verify(
         release: str, root: str = Query(..., description="Caller-owned root")
     ) -> dict[str, Any]:
         result = verify_release(Path(root), release)
+        if result.get("code") == "unavailable":
+            raise HTTPException(status_code=503, detail=result)
         if not result.get("valid"):
             raise HTTPException(status_code=422, detail=result)
         return result
+
+    @router.post(
+        "/promote",
+        summary="Explicit atomic approval-bearing CAS promotion",
+        operation_id="release_promote",
+        response_model=dict[str, Any],
+        description="Only verified, approved promotion appends as validated, records approval (reviewer/actor, reason, policy, target manifest hash), prior-pointer history, and one generation-token CAS transition. Same operation retry has no second event. Stale version/generation/approval, invalid candidate, and losing writer return typed conflict/failure and leave active state unchanged except typed audit. No torn pointer is visible; plan/build/verify never promote. Requires validated candidate, human approval, expected pointer version plus generation, and ABA-safe idempotent CAS.",
+    )
+    def promote(request: dict[str, Any]) -> dict[str, Any]:
+        from aksantara.embeddings.registry import promote_release
+
+        root = request.get("root")
+        candidate = (
+            request.get("candidate")
+            or request.get("candidate_version")
+            or request.get("version")
+        )
+        expected_version = request.get("expected_version")
+        expected_generation = request.get("expected_generation") or request.get(
+            "generation"
+        )
+        reviewer = request.get("reviewer") or request.get("actor")
+        reason = request.get("reason")
+        policy = request.get("policy") or request.get("policy_version")
+        operation_id = request.get("operation_id")
+        if not root or not candidate or not expected_version or not expected_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="root, candidate, expected_version, expected_generation required",
+            )
+        if not reviewer or not reason or not policy:
+            raise HTTPException(
+                status_code=422,
+                detail="human approval reviewer, reason, policy required",
+            )
+        # Resolve candidate hash for approval validation
+        try:
+            m = load_manifest(Path(root), candidate)
+            candidate_hash = m.get("manifestHash") or m.get("manifest_hash")
+        except Exception:
+            candidate_hash = None
+        approval = {
+            "reviewer": reviewer,
+            "reason": reason,
+            "policy": policy,
+            "target_manifest_hash": candidate_hash,
+        }
+        # Also accept explicit target hash override
+        if request.get("target_manifest_hash"):
+            approval["target_manifest_hash"] = request["target_manifest_hash"]
+        result = promote_release(
+            Path(root),
+            candidate,
+            expected_version=expected_version,
+            expected_generation=expected_generation,
+            approval=approval,
+            operation_id=operation_id,
+        )
+        if not result.get("success"):
+            status = result.get("status", 422)
+            raise HTTPException(status_code=status, detail=result)
+        return result
+
+    @router.post(
+        "/rollback",
+        summary="Validated rollback preserves versioned data",
+        operation_id="release_rollback",
+        response_model=dict[str, Any],
+        description="Rollback re-verifies an exact validated target, checks pointer generation, approval, and idempotency. It changes only pointer plus one typed append-only rollback event. Every pre-existing history event and release/raw/canonical/vector/manifest objects remain readable and byte-identical. Repeat is no-op/idempotent and invalid targets fail closed without fallback.",
+    )
+    def rollback(request: dict[str, Any]) -> dict[str, Any]:
+        from aksantara.embeddings.registry import rollback_release
+
+        root = request.get("root")
+        target = (
+            request.get("target")
+            or request.get("target_version")
+            or request.get("version")
+        )
+        expected_version = request.get("expected_version")
+        expected_generation = request.get("expected_generation") or request.get(
+            "generation"
+        )
+        reviewer = request.get("reviewer") or request.get("actor")
+        reason = request.get("reason")
+        policy = request.get("policy") or request.get("policy_version")
+        operation_id = request.get("operation_id")
+        if not root or not target or not expected_version or not expected_generation:
+            raise HTTPException(
+                status_code=422,
+                detail="root, target, expected_version, expected_generation required",
+            )
+        if not reviewer or not reason or not policy:
+            raise HTTPException(
+                status_code=422,
+                detail="human approval reviewer, reason, policy required",
+            )
+        try:
+            m = load_manifest(Path(root), target)
+            target_hash = m.get("manifestHash") or m.get("manifest_hash")
+        except Exception:
+            target_hash = None
+        approval = {
+            "reviewer": reviewer,
+            "reason": reason,
+            "policy": policy,
+            "target_manifest_hash": target_hash,
+        }
+        if request.get("target_manifest_hash"):
+            approval["target_manifest_hash"] = request["target_manifest_hash"]
+        result = rollback_release(
+            Path(root),
+            target,
+            expected_version=expected_version,
+            expected_generation=expected_generation,
+            approval=approval,
+            operation_id=operation_id,
+        )
+        if not result.get("success"):
+            status = result.get("status", 422)
+            raise HTTPException(status_code=status, detail=result)
+        return result
+
+    @router.get(
+        "/current",
+        summary="Read active release pointer (version+generation)",
+        operation_id="release_current",
+        response_model=dict[str, Any],
+        description="Returns current pointer version and opaque generation token; ABA-safe and idempotent CAS uses expected version plus generation.",
+    )
+    def current(
+        root: str = Query(..., description="Caller-owned root"),
+    ) -> dict[str, Any]:
+        from aksantara.embeddings.registry import load_current
+
+        cur = load_current(Path(root))
+        if cur is None:
+            raise HTTPException(status_code=404, detail="no current pointer")
+        return cur
+
+    @router.get(
+        "/history",
+        summary="Read release history and pointer events",
+        operation_id="release_history",
+        response_model=dict[str, Any],
+        description="Append-only release history: validated releases and promotion/rollback events with approval and generation.",
+    )
+    def history(
+        root: str = Query(..., description="Caller-owned root"),
+    ) -> dict[str, Any]:
+        from aksantara.embeddings.registry import load_history
+
+        return load_history(Path(root))
 
     @router.get(
         "",
