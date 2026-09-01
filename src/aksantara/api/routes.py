@@ -34,6 +34,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from aksantara.api.checkpoint_routes import create_checkpoint_router
+from aksantara.api.release_routes import create_release_router
 from aksantara.api.replay_routes import create_replay_router
 from aksantara.domain.models import KBBIEntry
 from aksantara.retrieve.citations import RetrievalInfo, render_citation
@@ -665,6 +666,7 @@ def create_app(
     app.include_router(router)
     app.include_router(create_checkpoint_router())
     app.include_router(create_replay_router())
+    app.include_router(create_release_router())
 
     # Expose a simple root redirect for convenience.
     @app.get("/", include_in_schema=False)

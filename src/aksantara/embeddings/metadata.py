@@ -1,0 +1,23 @@
+"""Published embedding metadata constants for Vertex vectors."""
+
+from __future__ import annotations
+
+__all__ = [
+    "EMBEDDING_MODEL",
+    "EMBEDDING_DIMS",
+    "EMBEDDING_TASK_DOCUMENT",
+    "EMBEDDING_TASK_QUERY",
+    "EMBEDDING_DISTANCE",
+    "EMBEDDING_SCHEMA_VERSION",
+    "COST_ESTIMATE_VERSION",
+    "MAX_BATCH_SIZE",
+]
+
+EMBEDDING_MODEL: str = "gemini-embedding-001"
+EMBEDDING_DIMS: int = 768
+EMBEDDING_TASK_DOCUMENT: str = "RETRIEVAL_DOCUMENT"
+EMBEDDING_TASK_QUERY: str = "RETRIEVAL_QUERY"
+EMBEDDING_DISTANCE: str = "DOT_PRODUCT"
+EMBEDDING_SCHEMA_VERSION: str = "emb-768-v1"
+COST_ESTIMATE_VERSION: str = "cost-v1"
+MAX_BATCH_SIZE: int = 500
